@@ -1,0 +1,13 @@
+# Build artifacts
+/run
+/mla-moe
+*.o
+
+# Validation dumps (regenerated from weights)
+/tests/weight_loading/dumps/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
