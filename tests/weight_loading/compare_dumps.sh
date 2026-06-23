@@ -5,10 +5,10 @@
 # (--list), filtered to those present in the given checkpoint.
 #
 # Usage:
-#   tests/validate/compare_dumps.sh <model_shortname> <shard_dir> [n_elems]
+#   tests/weight_loading/compare_dumps.sh <model_shortname> <shard_dir> [n_elems]
 #
 # Example:
-#   tests/validate/compare_dumps.sh dsv2lite /path/to/DeepSeek-V2-Lite
+#   tests/weight_loading/compare_dumps.sh dsv2lite /path/to/DeepSeek-V2-Lite
 #
 set -u
 
@@ -18,9 +18,9 @@ N="${3:-64}"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CLI="$ROOT/mla-moe"
-DUMP_PY="$ROOT/tests/validate/dump_hex.py"
+DUMP_PY="$ROOT/tests/weight_loading/dump_hex.py"
 IDX="$SHARD_DIR/model.safetensors.index.json"
-OUT="$ROOT/tests/validate/dumps/$MODEL"
+OUT="$ROOT/tests/weight_loading/dumps/$MODEL"
 
 # Prefer the project venv (has numpy); fall back to system python3.
 if [ -x "$ROOT/.venv/bin/python" ]; then PY="$ROOT/.venv/bin/python"; else PY=python3; fi
