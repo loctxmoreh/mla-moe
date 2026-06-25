@@ -437,12 +437,16 @@ void free_transformer(Transformer *t) {
  * bf16 weights, fp32 compute; one stream, whole prompt in one call.
  * ------------------------------------------------------------------------- */
 
-/* Optional validation dump dir; set via run_set_dump(). NULL => no dumps. */
+/* Validation dumps are compiled in only with -DMLA_ENABLE_DUMP (build with
+ * `make DUMP=1`). By default DUMPING() is a compile-time 0, so every dump block
+ * and its scratch is dead-code-eliminated — production builds carry no dump
+ * code, branches, or I/O. Set the output dir at runtime via run_set_dump(). */
+#ifdef MLA_ENABLE_DUMP
 static const char *g_dump = NULL;
 void run_set_dump(const char *dir) { g_dump = dir; }
+#define DUMPING() (g_dump != NULL)
 
 static void dump_bin(const char *name, const void *p, size_t n, size_t elem) {
-    if (!g_dump) return;
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.bin", g_dump, name);
     FILE *f = fopen(path, "wb");
@@ -452,6 +456,13 @@ static void dump_bin(const char *name, const void *p, size_t n, size_t elem) {
 }
 #define DUMP_F32(name, ptr, n) dump_bin(name, ptr, n, sizeof(float))
 #define DUMP_I32(name, ptr, n) dump_bin(name, ptr, n, sizeof(int32_t))
+#else
+void run_set_dump(const char *dir) { (void)dir; }
+#define DUMPING() 0
+/* discard args (marks them used) so dead dump blocks don't warn */
+#define DUMP_F32(name, ptr, n) ((void)(name), (void)(ptr), (void)(n))
+#define DUMP_I32(name, ptr, n) ((void)(name), (void)(ptr), (void)(n))
+#endif
 
 /* y = (x / rms(x)) * w, over n elements (RMSNorm). */
 static void rmsnorm(float *y, const float *x, const bf16_t *w, int n, float eps) {
@@ -546,7 +557,8 @@ static void ffn_compute(const Config *c, ModelWeights *w, RunState *s, int l,
 }
 
 /* Whole-prompt prefill. Returns logits at the LAST position (RunState.logits).
- * With g_dump set, also writes the oracle-named intermediates for validation. */
+ * When built with -DMLA_ENABLE_DUMP and a dump dir is set, also writes the
+ * oracle-named intermediates for validation. */
 float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
     const Config *c = &t->config;
     ModelWeights *w = &t->weights;
@@ -579,7 +591,7 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
     float *ao    = malloc((size_t)n_prompt * H * sizeof(float));   /* attn module out */
     float *mo    = malloc((size_t)n_prompt * H * sizeof(float));   /* mlp module out */
     /* hidden_states snapshot [n_layers+1][n_prompt][H] (dump only) */
-    float *hs = g_dump ? malloc((size_t)(c->n_layers + 1) * n_prompt * H * sizeof(float)) : NULL;
+    float *hs = DUMPING() ? malloc((size_t)(c->n_layers + 1) * n_prompt * H * sizeof(float)) : NULL;
 
     /* embed */
     for (int p = 0; p < n_prompt; p++)
@@ -648,7 +660,7 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
             for (int i = 0; i < H; i++) xs[p * H + i] += ao[p * H + i];
 
         /* ---- FFN: dense for l < first_k_dense, else MoE (shared helper) ---- */
-        int dump_router = g_dump && (l == c->first_k_dense);
+        int dump_router = DUMPING() && (l == c->first_k_dense);
         for (int p = 0; p < n_prompt; p++) {
             rmsnorm(xb, &xs[p * H], w->post_attn_norm[l], H, eps);
             int ti_p[16]; float tw_p[16];
@@ -672,7 +684,7 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
             for (int i = 0; i < H; i++) xs[p * H + i] += mo[p * H + i];
 
         /* ---- per-layer dumps ---- */
-        if (g_dump) {
+        if (DUMPING()) {
             char nm[64];
             snprintf(nm, sizeof(nm), "prefill_layer%02d_attn_out", l);
             DUMP_F32(nm, ao, (size_t)n_prompt * H);
@@ -712,7 +724,7 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
     }
 
     /* final norm + lm_head */
-    if (g_dump) {
+    if (DUMPING()) {
         float *logits_all = malloc((size_t)n_prompt * VOC * sizeof(float));
         for (int p = 0; p < n_prompt; p++) {
             rmsnorm(xb, &xs[p * H], w->norm, H, eps);
@@ -739,7 +751,8 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
  * and attends in latent space: W_UK is folded into the query and W_UV into the
  * output, so no per-head K/V is ever materialized. Mathematically identical to
  * forward_unabsorbed for the same inputs; cheaper at q_len=1. Returns logits.
- * With g_dump set, writes the layer-0 decode_* internals (oracle-named). */
+ * When built with -DMLA_ENABLE_DUMP and a dump dir is set, writes the layer-0
+ * decode_* internals (oracle-named). */
 float *forward_absorbed(Transformer *t, int token, int pos) {
     const Config *c = &t->config;
     ModelWeights *w = &t->weights;
@@ -770,9 +783,9 @@ float *forward_absorbed(Transformer *t, int token, int pos) {
     float *ao   = malloc(H * sizeof(float));
     float *mo   = malloc(H * sizeof(float));
     /* layer-0 decode dump scratch (heads-major, like the oracle) */
-    float *d_qabs = g_dump ? malloc((size_t)NH * KVL * sizeof(float)) : NULL;
-    float *d_clat = g_dump ? malloc((size_t)NH * KVL * sizeof(float)) : NULL;
-    float *d_attn = g_dump ? malloc((size_t)NH * kv_len * sizeof(float)) : NULL;
+    float *d_qabs = DUMPING() ? malloc((size_t)NH * KVL * sizeof(float)) : NULL;
+    float *d_clat = DUMPING() ? malloc((size_t)NH * KVL * sizeof(float)) : NULL;
+    float *d_attn = DUMPING() ? malloc((size_t)NH * kv_len * sizeof(float)) : NULL;
 
     for (int i = 0; i < H; i++) x[i] = bf16_to_f32(w->embed_tokens[(size_t)token * H + i]);
 
@@ -823,7 +836,7 @@ float *forward_absorbed(Transformer *t, int token, int pos) {
             }
             matmul(&ctx[(size_t)h * VHD], clat, WUV, VHD, KVL);
 
-            if (g_dump && l == 0) {
+            if (DUMPING() && l == 0) {
                 memcpy(&d_qabs[(size_t)h * KVL], qabs, KVL * sizeof(float));
                 memcpy(&d_clat[(size_t)h * KVL], clat, KVL * sizeof(float));
                 memcpy(&d_attn[(size_t)h * kv_len], score, kv_len * sizeof(float));
@@ -836,7 +849,7 @@ float *forward_absorbed(Transformer *t, int token, int pos) {
         ffn_compute(c, w, s, l, xb, mo, NULL, NULL);
         for (int i = 0; i < H; i++) x[i] += mo[i];
 
-        if (g_dump && l == 0) {
+        if (DUMPING() && l == 0) {
             DUMP_F32("decode_layer0_q_absorbed", d_qabs, (size_t)NH * KVL);
             DUMP_F32("decode_layer0_ctx_latent", d_clat, (size_t)NH * KVL);
             DUMP_F32("decode_layer0_attn_weights", d_attn, (size_t)NH * kv_len);
@@ -856,7 +869,7 @@ float *forward_absorbed(Transformer *t, int token, int pos) {
 
     rmsnorm(xb, x, w->norm, H, eps);
     matmul(s->logits, xb, w->lm_head, VOC, H);
-    if (g_dump) DUMP_F32("decode_logits", s->logits, VOC);
+    if (DUMPING()) DUMP_F32("decode_logits", s->logits, VOC);
 
     free(x); free(xb); free(comp); free(q); free(qabs); free(score);
     free(clat); free(ctx); free(ao); free(mo);
@@ -914,6 +927,11 @@ int main(int argc, char *argv[]) {
     const char *shard_dir  = argv[3];
     const char *tokens_path = (argc > 4) ? argv[4] : NULL;
     const char *dump_dir    = (argc > 5) ? argv[5] : NULL;
+#ifndef MLA_ENABLE_DUMP
+    if (dump_dir)
+        fprintf(stderr, "note: dump_dir given but dumps not compiled in "
+                        "(rebuild with `make DUMP=1`); running without dumps.\n");
+#endif
 
     Transformer t;
     build_transformer(&t, model, index_path, shard_dir);

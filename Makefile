@@ -3,6 +3,12 @@ CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wpedantic \
           -Iinclude -Ivendor
 LDFLAGS = -lm
 
+# Build with `make DUMP=1` to compile in the oracle-validation dumps
+# (forward_*'s intermediate writes). Off by default: no dump code in the binary.
+ifdef DUMP
+CFLAGS += -DMLA_ENABLE_DUMP
+endif
+
 LIB_SRCS = src/safetensors_loader.c \
            src/tensor.c
 
