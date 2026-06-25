@@ -22,8 +22,13 @@ DUMP_PY="$ROOT/tests/weight_loading/dump_hex.py"
 IDX="$SHARD_DIR/model.safetensors.index.json"
 OUT="$ROOT/tests/weight_loading/dumps/$MODEL"
 
-# Prefer the project venv (has numpy); fall back to system python3.
-if [ -x "$ROOT/.venv/bin/python" ]; then PY="$ROOT/.venv/bin/python"; else PY=python3; fi
+if command -v uv >/dev/null 2>&1 && [ -f "$ROOT/pyproject.toml" ]; then
+    PY=(uv run --project "$ROOT" python)
+elif [ -x "$ROOT/.venv/bin/python" ]; then
+    PY=("$ROOT/.venv/bin/python")
+else
+    PY=(python3)
+fi
 
 if [ ! -x "$CLI" ]; then
     echo "error: $CLI not built. Run: make CC=gcc mla-moe" >&2
@@ -32,7 +37,7 @@ fi
 
 mkdir -p "$OUT"
 
-mapfile -t TENSORS < <("$PY" "$DUMP_PY" --list "$SHARD_DIR")
+mapfile -t TENSORS < <("${PY[@]}" "$DUMP_PY" --list "$SHARD_DIR")
 if [ "${#TENSORS[@]}" -eq 0 ]; then
     echo "error: no checked tensors present in $SHARD_DIR" >&2
     exit 1
@@ -44,7 +49,7 @@ for T in "${TENSORS[@]}"; do
     cfile="$OUT/$safe.c.hex"
     pfile="$OUT/$safe.py.hex"
 
-    if ! "$PY" "$DUMP_PY" "$SHARD_DIR" "$T" "$N" "$pfile"; then
+    if ! "${PY[@]}" "$DUMP_PY" "$SHARD_DIR" "$T" "$N" "$pfile"; then
         printf 'FAIL  %-55s (python dump error)\n' "$T"; fail=$((fail+1)); continue
     fi
     if ! "$CLI" dump "$IDX" "$SHARD_DIR" "$T" "$N" "$cfile" 2>/dev/null; then
