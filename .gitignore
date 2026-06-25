@@ -5,6 +5,7 @@
 
 # Validation dumps (regenerated from weights)
 /tests/weight_loading/dumps/
+/tests/oracle/dumps/
 
 # Python
 __pycache__/
