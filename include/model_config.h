@@ -26,6 +26,13 @@
 #define DSV2LITE_FIRST_K_DENSE       1
 #define DSV2LITE_VOCAB_SIZE          102400
 #define DSV2LITE_MAX_SEQ_LEN         4096   /* pre-YaRN; Phase-0 cap */
+#define DSV2LITE_RMS_EPS             1e-6f
+/* YaRN RoPE (rope_scaling in config.json). mscale==mscale_all_dim => _mscale=1. */
+#define DSV2LITE_ROPE_THETA          10000.0f
+#define DSV2LITE_ROPE_FACTOR         40.0f
+#define DSV2LITE_ROPE_BETA_FAST      32.0f
+#define DSV2LITE_ROPE_BETA_SLOW      1.0f
+#define DSV2LITE_ROPE_ORIG_MAX       4096.0f
 
 /* GLM-4.7-Flash (31.2B / 3.6B active) — secondary target */
 #define GLM47_N_LAYERS               47

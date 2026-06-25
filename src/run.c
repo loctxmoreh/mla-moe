@@ -1,5 +1,6 @@
 /* MLA-MOE inference entry point; structure follows llama2.c.
- * Phase 0: forward()/sample() are stubs; the loader + teardown are real. */
+ * Phase 1 (dsv2lite): forward_unabsorbed() runs the whole-prompt prefill and is
+ * oracle-validated; forward_absorbed() (decode) is Phase 2. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,8 +25,14 @@ typedef struct {
     int   n_routed_experts;
     int   n_shared_experts;
     int   n_experts_per_tok;  /* top-k routed experts per token */
+    int   dense_inter_size;   /* mlp.{gate,up,down}_proj width on dense layers */
+    int   moe_inter_size;     /* per-expert FFN width on MoE layers */
     int   vocab_size;
     int   max_seq_len;
+    float rms_eps;
+    float softmax_scale;      /* q_head_dim**-0.5 (no mscale for dsv2lite) */
+    /* YaRN RoPE params (for inv_freq construction at build time) */
+    float rope_theta, rope_factor, rope_beta_fast, rope_beta_slow, rope_orig_max;
 } Config;
 
 /* bf16_t* point into TensorStore mmaps (zero copy); per-layer arrays are
@@ -117,6 +124,7 @@ typedef struct {
     ModelWeights weights;
     RunState     state;
     TensorStore *store;
+    float       *rope_inv_freq;   /* [qk_rope_head_dim/2], YaRN-interpolated */
 } Transformer;
 
 /* Checked lookup: fail with the name instead of segfaulting on a NULL st_get.
@@ -263,7 +271,11 @@ static void malloc_run_state(RunState *s, const Config *c) {
     int h = c->hidden_size;
     int kv_dim   = c->kv_lora_rank + c->qk_rope_head_dim;
     int q_dim    = c->n_heads * (c->qk_nope_head_dim + c->qk_rope_head_dim);
-    int inter    = 1408;    /* hardcoded for Phase 0; read from config later */
+    /* widest FFN: dense, the (n_shared * moe) shared-expert MLP, or one routed expert */
+    int shared   = c->moe_inter_size * c->n_shared_experts;
+    int inter    = c->dense_inter_size;
+    if (shared > inter)         inter = shared;
+    if (c->moe_inter_size > inter) inter = c->moe_inter_size;
 
     s->x          = calloc(h, sizeof(float));
     s->xb         = calloc(h, sizeof(float));
@@ -322,8 +334,18 @@ static Config config_for(const char *model) {
             .n_routed_experts   = DSV2LITE_N_ROUTED_EXPERTS,
             .n_shared_experts   = DSV2LITE_N_SHARED_EXPERTS,
             .n_experts_per_tok  = DSV2LITE_N_EXPERTS_PER_TOK,
+            .dense_inter_size   = DSV2LITE_DENSE_INTER_SIZE,
+            .moe_inter_size     = DSV2LITE_MOE_INTER_SIZE,
             .vocab_size         = DSV2LITE_VOCAB_SIZE,
             .max_seq_len        = DSV2LITE_MAX_SEQ_LEN,
+            .rms_eps            = DSV2LITE_RMS_EPS,
+            /* softmax_scale = q_head_dim**-0.5 = (qk_nope+qk_rope)**-0.5 */
+            .softmax_scale      = 1.0f / sqrtf(DSV2LITE_QK_NOPE_HEAD_DIM + DSV2LITE_QK_ROPE_HEAD_DIM),
+            .rope_theta         = DSV2LITE_ROPE_THETA,
+            .rope_factor        = DSV2LITE_ROPE_FACTOR,
+            .rope_beta_fast     = DSV2LITE_ROPE_BETA_FAST,
+            .rope_beta_slow     = DSV2LITE_ROPE_BETA_SLOW,
+            .rope_orig_max      = DSV2LITE_ROPE_ORIG_MAX,
         };
     }
     if (strcmp(model, "glm47") == 0) {
@@ -341,12 +363,52 @@ static Config config_for(const char *model) {
             .n_routed_experts   = GLM47_N_ROUTED_EXPERTS,
             .n_shared_experts   = GLM47_N_SHARED_EXPERTS,
             .n_experts_per_tok  = GLM47_N_EXPERTS_PER_TOK,
+            .dense_inter_size   = GLM47_DENSE_INTER_SIZE,
+            .moe_inter_size     = GLM47_MOE_INTER_SIZE,
             .vocab_size         = GLM47_VOCAB_SIZE,
             .max_seq_len        = GLM47_MAX_SEQ_LEN,
+            .rms_eps            = 1e-5f,   /* GLM; Phase 3 */
+            .softmax_scale      = 1.0f / sqrtf(GLM47_QK_NOPE_HEAD_DIM + GLM47_QK_ROPE_HEAD_DIM),
+            /* GLM RoPE params filled in Phase 3 (interleaved, different YaRN) */
+            .rope_theta = 10000.0f, .rope_factor = 1.0f,
+            .rope_beta_fast = 32.0f, .rope_beta_slow = 1.0f, .rope_orig_max = 4096.0f,
         };
     }
     fprintf(stderr, "unknown model '%s' (expected: dsv2lite | glm47)\n", model);
     exit(1);
+}
+
+/* DeepSeek-V2 YaRN inv_freq: blends interpolated/extrapolated freqs over a
+ * correction range. Mirrors transformers' DeepseekV2YarnRotaryEmbedding init.
+ * (mscale == mscale_all_dim for dsv2lite, so the freq magnitude is 1 — only the
+ * frequencies are interpolated, not the rotation amplitude.) */
+static float *build_rope_inv_freq(const Config *c) {
+    int dim  = c->qk_rope_head_dim;   /* 64 */
+    int half = dim / 2;               /* 32 */
+    float base = c->rope_theta, factor = c->rope_factor;
+    /* correction range: dims rotating faster than beta_fast use extrapolation,
+     * slower than beta_slow use interpolation, linear ramp in between */
+    float lo_d = (dim * logf(c->rope_orig_max / (c->rope_beta_fast * 2.0f * 3.14159265358979323846f)))
+               / (2.0f * logf(base));
+    float hi_d = (dim * logf(c->rope_orig_max / (c->rope_beta_slow * 2.0f * 3.14159265358979323846f)))
+               / (2.0f * logf(base));
+    float low  = floorf(lo_d), high = ceilf(hi_d);
+    if (low < 0) low = 0;
+    if (high > dim - 1) high = dim - 1;
+    float denom = (high == low) ? 0.001f : (high - low);
+
+    float *inv = malloc(half * sizeof(float));
+    for (int j = 0; j < half; j++) {
+        float p        = (float)(2 * j) / (float)dim;
+        float f_extra  = 1.0f / powf(base, p);            /* full-frequency */
+        float f_inter  = f_extra / factor;                /* interpolated   */
+        float ramp     = ((float)j - low) / denom;        /* 0..1 across range */
+        if (ramp < 0) ramp = 0;
+        if (ramp > 1) ramp = 1;
+        float mask     = 1.0f - ramp;                     /* inv_freq_mask */
+        inv[j] = f_inter * (1.0f - mask) + f_extra * mask;
+    }
+    return inv;
 }
 
 void build_transformer(Transformer *t, const char *model,
@@ -359,79 +421,363 @@ void build_transformer(Transformer *t, const char *model,
     build_model_weights(t);
     /* 4. allocate run-state buffers */
     malloc_run_state(&t->state, &t->config);
+    /* 5. precompute RoPE frequencies */
+    t->rope_inv_freq = build_rope_inv_freq(&t->config);
 }
 
 void free_transformer(Transformer *t) {
+    free(t->rope_inv_freq);
     free_run_state(&t->state);
     free_model_weights(&t->weights, t->config.n_layers);
     st_free(t->store);
 }
 
-/* Inference stubs — filled in Phase 1+. */
+/* ---------------------------------------------------------------------------
+ * Phase 1: unabsorbed (prefill) forward pass for dsv2lite.
+ * bf16 weights, fp32 compute; one stream, whole prompt in one call.
+ * ------------------------------------------------------------------------- */
 
-/* One transformer step; returns logits (owned by RunState). */
-float *forward(Transformer *t, int token, int pos) {
-    (void)t; (void)token; (void)pos;
-    fprintf(stderr, "forward(): not yet implemented\n");
-    exit(1);
+/* Optional validation dump dir; set via run_set_dump(). NULL => no dumps. */
+static const char *g_dump = NULL;
+void run_set_dump(const char *dir) { g_dump = dir; }
+
+static void dump_bin(const char *name, const void *p, size_t n, size_t elem) {
+    if (!g_dump) return;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s.bin", g_dump, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "dump: cannot open %s\n", path); return; }
+    fwrite(p, elem, n, f);
+    fclose(f);
+}
+#define DUMP_F32(name, ptr, n) dump_bin(name, ptr, n, sizeof(float))
+#define DUMP_I32(name, ptr, n) dump_bin(name, ptr, n, sizeof(int32_t))
+
+/* y = (x / rms(x)) * w, over n elements (RMSNorm). */
+static void rmsnorm(float *y, const float *x, const bf16_t *w, int n, float eps) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    float inv = 1.0f / sqrtf(ss / (float)n + eps);
+    for (int i = 0; i < n; i++) y[i] = x[i] * inv * bf16_to_f32(w[i]);
 }
 
-int sample(float *logits, int vocab_size) {
-    (void)logits; (void)vocab_size;
-    fprintf(stderr, "sample(): not yet implemented\n");
-    exit(1);
-}
-
-/* Mirrors llama2.c's generate() loop; locks in the structure for Phase 1. */
-static void generate(Transformer *t, int *prompt_tokens, int n_prompt,
-                     int max_new_tokens) {
-    int token = prompt_tokens[0];
-    int pos   = 0;
-
-    while (pos < n_prompt + max_new_tokens - 1) {
-        float *logits = forward(t, token, pos);  /* stub exits here in Phase 0 */
-        int next;
-        if (pos < n_prompt - 1) {
-            next = prompt_tokens[pos + 1];       /* teacher-force prompt tokens */
-        } else {
-            next = sample(logits, t->config.vocab_size);
-        }
-        token = next;
-        pos++;
+/* y[d] = sum_i x[i] * W[d,i], W is bf16 row-major [d_out, n_in] (== x @ W.T). */
+static void matmul(float *y, const float *x, const bf16_t *w, int d_out, int n_in) {
+    for (int d = 0; d < d_out; d++) {
+        const bf16_t *row = w + (size_t)d * n_in;
+        float acc = 0.0f;
+        for (int i = 0; i < n_in; i++) acc += x[i] * bf16_to_f32(row[i]);
+        y[d] = acc;
     }
+}
+
+static inline float silu(float x) { return x / (1.0f + expf(-x)); }
+
+/* In-place DeepSeek complex (adjacent-pair) RoPE on a rope_dim slice at `pos`. */
+static void rope_apply(float *v, int pos, const float *inv_freq, int rope_dim) {
+    for (int j = 0; j < rope_dim / 2; j++) {
+        float ang = (float)pos * inv_freq[j];
+        float c = cosf(ang), s = sinf(ang);
+        float x0 = v[2 * j], x1 = v[2 * j + 1];
+        v[2 * j]     = x0 * c - x1 * s;
+        v[2 * j + 1] = x0 * s + x1 * c;
+    }
+}
+
+/* SwiGLU MLP: dst = down( silu(gate·x) ⊙ (up·x) ). hb/hb2 are [inter] scratch. */
+static void swiglu(float *dst, const float *x, const bf16_t *gate,
+                   const bf16_t *up, const bf16_t *down,
+                   int inter, int hidden, float *hb, float *hb2) {
+    matmul(hb,  x, gate, inter, hidden);
+    matmul(hb2, x, up,   inter, hidden);
+    for (int i = 0; i < inter; i++) hb[i] = silu(hb[i]) * hb2[i];
+    matmul(dst, hb, down, hidden, inter);
+}
+
+/* numerically-stable softmax over n elements (treats -inf as 0). */
+static void softmax(float *x, int n) {
+    float mx = -INFINITY;
+    for (int i = 0; i < n; i++) if (x[i] > mx) mx = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        x[i] = (x[i] == -INFINITY) ? 0.0f : expf(x[i] - mx);
+        sum += x[i];
+    }
+    for (int i = 0; i < n; i++) x[i] /= sum;
+}
+
+/* Whole-prompt prefill. Returns logits at the LAST position (RunState.logits).
+ * With g_dump set, also writes the oracle-named intermediates for validation. */
+float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
+    const Config *c = &t->config;
+    ModelWeights *w = &t->weights;
+    RunState     *s = &t->state;
+    const float  *inv_freq = t->rope_inv_freq;
+
+    const int H   = c->hidden_size;
+    const int NH  = c->n_heads;
+    const int QKN = c->qk_nope_head_dim, QKR = c->qk_rope_head_dim;
+    const int QHD = QKN + QKR;
+    const int VHD = c->v_head_dim;
+    const int KVL = c->kv_lora_rank;
+    const int KVD = KVL + QKR;
+    const int VOC = c->vocab_size;
+    const float scale = c->softmax_scale, eps = c->rms_eps;
+    const size_t kv_stride = (size_t)(QKN + VHD) * KVL;   /* per-head kv_b stride */
+    const size_t cache_row = (size_t)c->max_seq_len * KVD;
+
+    /* residual stream for all prompt positions */
+    float *xs = malloc((size_t)n_prompt * H * sizeof(float));
+    /* per-layer scratch (reused across layers) */
+    float *xb    = malloc(H * sizeof(float));
+    float *comp  = malloc(KVD * sizeof(float));
+    float *qall  = malloc((size_t)n_prompt * NH * QHD * sizeof(float));
+    float *knope = malloc((size_t)NH * n_prompt * QKN * sizeof(float));   /* [h][k][d] */
+    float *value = malloc((size_t)NH * n_prompt * VHD * sizeof(float));   /* [h][k][d] */
+    float *scr   = malloc((size_t)NH * n_prompt * n_prompt * sizeof(float)); /* [h][q][k] scores */
+    float *wgt   = malloc((size_t)NH * n_prompt * n_prompt * sizeof(float)); /* [h][q][k] weights */
+    float *ctx   = malloc((size_t)NH * VHD * sizeof(float));
+    float *ao    = malloc((size_t)n_prompt * H * sizeof(float));   /* attn module out */
+    float *mo    = malloc((size_t)n_prompt * H * sizeof(float));   /* mlp module out */
+    float *eo    = malloc(H * sizeof(float));                      /* one expert out */
+    /* hidden_states snapshot [n_layers+1][n_prompt][H] (dump only) */
+    float *hs = g_dump ? malloc((size_t)(c->n_layers + 1) * n_prompt * H * sizeof(float)) : NULL;
+
+    /* embed */
+    for (int p = 0; p < n_prompt; p++)
+        for (int i = 0; i < H; i++)
+            xs[p * H + i] = bf16_to_f32(w->embed_tokens[(size_t)tokens[p] * H + i]);
+    if (hs) memcpy(hs, xs, (size_t)n_prompt * H * sizeof(float));
+
+    for (int l = 0; l < c->n_layers; l++) {
+        float *kv_l = &s->kv_cache[(size_t)l * cache_row];
+
+        /* ---- per-position projections: q (roped), c_kv, k_pe (roped, cached) ---- */
+        for (int p = 0; p < n_prompt; p++) {
+            rmsnorm(xb, &xs[p * H], w->input_layernorm[l], H, eps);
+            matmul(&qall[(size_t)p * NH * QHD], xb, w->q_proj[l], NH * QHD, H);
+            for (int h = 0; h < NH; h++)
+                rope_apply(&qall[((size_t)p * NH + h) * QHD + QKN], p, inv_freq, QKR);
+
+            matmul(comp, xb, w->kv_a_proj[l], KVD, H);
+            float *cache_p = &kv_l[(size_t)p * KVD];
+            rmsnorm(cache_p, comp, w->kv_a_layernorm[l], KVL, eps);  /* c_kv */
+            memcpy(cache_p + KVL, comp + KVL, QKR * sizeof(float));  /* k_pe (raw) */
+            rope_apply(cache_p + KVL, p, inv_freq, QKR);             /* k_pe (roped) */
+        }
+
+        /* ---- decompress per-head K_nope and V for every key ---- */
+        for (int h = 0; h < NH; h++) {
+            const bf16_t *WUK = w->W_UK[l] + (size_t)h * kv_stride;
+            const bf16_t *WUV = w->W_UV[l] + (size_t)h * kv_stride;
+            for (int k = 0; k < n_prompt; k++) {
+                const float *ckv = &kv_l[(size_t)k * KVD];
+                matmul(&knope[((size_t)h * n_prompt + k) * QKN], ckv, WUK, QKN, KVL);
+                matmul(&value[((size_t)h * n_prompt + k) * VHD], ckv, WUV, VHD, KVL);
+            }
+        }
+
+        /* ---- attention: per query, per head ---- */
+        for (int q = 0; q < n_prompt; q++) {
+            for (int h = 0; h < NH; h++) {
+                const float *qnope = &qall[((size_t)q * NH + h) * QHD];
+                const float *qpe   = qnope + QKN;
+                float *row = &scr[((size_t)h * n_prompt + q) * n_prompt];
+                for (int k = 0; k < n_prompt; k++) {
+                    if (k > q) { row[k] = -INFINITY; continue; }   /* causal */
+                    const float *knope_hk = &knope[((size_t)h * n_prompt + k) * QKN];
+                    const float *kpe_k    = &kv_l[(size_t)k * KVD + KVL];
+                    float dot = 0.0f;
+                    for (int d = 0; d < QKN; d++) dot += qnope[d] * knope_hk[d];
+                    for (int d = 0; d < QKR; d++) dot += qpe[d]   * kpe_k[d];
+                    row[k] = dot * scale;
+                }
+                float *wrow = &wgt[((size_t)h * n_prompt + q) * n_prompt];
+                memcpy(wrow, row, n_prompt * sizeof(float));
+                softmax(wrow, n_prompt);
+
+                float *ctx_h = &ctx[(size_t)h * VHD];
+                for (int d = 0; d < VHD; d++) ctx_h[d] = 0.0f;
+                for (int k = 0; k <= q; k++) {
+                    float a = wrow[k];
+                    const float *val_hk = &value[((size_t)h * n_prompt + k) * VHD];
+                    for (int d = 0; d < VHD; d++) ctx_h[d] += a * val_hk[d];
+                }
+            }
+            matmul(&ao[(size_t)q * H], ctx, w->o_proj[l], H, NH * VHD);
+        }
+        for (int p = 0; p < n_prompt; p++)
+            for (int i = 0; i < H; i++) xs[p * H + i] += ao[p * H + i];
+
+        /* ---- FFN: dense for l < first_k_dense, else MoE ---- */
+        for (int p = 0; p < n_prompt; p++) {
+            rmsnorm(xb, &xs[p * H], w->post_attn_norm[l], H, eps);
+            float *out = &mo[(size_t)p * H];
+            if (l < c->first_k_dense) {
+                swiglu(out, xb, w->dense_gate[l], w->dense_up[l], w->dense_down[l],
+                       c->dense_inter_size, H, s->hb, s->hb2);
+            } else {
+                /* router: softmax over experts, greedy top-k */
+                matmul(s->moe_logits, xb, w->moe_gate[l], c->n_routed_experts, H);
+                softmax(s->moe_logits, c->n_routed_experts);
+                int   K = c->n_experts_per_tok;
+                int   idx[16]; float wts[16];   /* K <= 16 */
+                char  used[1024] = {0};         /* n_routed <= 1024 */
+                for (int r = 0; r < K; r++) {
+                    int best = -1; float bv = -INFINITY;
+                    for (int e = 0; e < c->n_routed_experts; e++) {
+                        if (used[e]) continue;
+                        if (s->moe_logits[e] > bv) { bv = s->moe_logits[e]; best = e; }
+                    }
+                    used[best] = 1; idx[r] = best; wts[r] = bv;   /* routed_scaling=1, no norm */
+                }
+                /* dump first MoE layer's router (oracle: prefill_moe1_*) */
+                if (g_dump && l == c->first_k_dense) {
+                    static float rs[8 * 1024]; static int ti[8 * 16]; static float tw[8 * 16];
+                    memcpy(&rs[(size_t)p * c->n_routed_experts], s->moe_logits,
+                           c->n_routed_experts * sizeof(float));
+                    for (int r = 0; r < K; r++) { ti[p * K + r] = idx[r]; tw[p * K + r] = wts[r]; }
+                    if (p == n_prompt - 1) {
+                        DUMP_F32("prefill_moe1_router_scores", rs, (size_t)n_prompt * c->n_routed_experts);
+                        DUMP_I32("prefill_moe1_topk_idx", ti, (size_t)n_prompt * K);
+                        DUMP_F32("prefill_moe1_topk_w",   tw, (size_t)n_prompt * K);
+                    }
+                }
+                for (int i = 0; i < H; i++) out[i] = 0.0f;
+                for (int r = 0; r < K; r++) {
+                    swiglu(eo, xb, w->expert_gate[l][idx[r]], w->expert_up[l][idx[r]],
+                           w->expert_down[l][idx[r]], c->moe_inter_size, H, s->hb, s->hb2);
+                    for (int i = 0; i < H; i++) out[i] += wts[r] * eo[i];
+                }
+                /* shared experts: one MLP of width n_shared * moe_inter */
+                swiglu(eo, xb, w->shared_gate[l], w->shared_up[l], w->shared_down[l],
+                       c->n_shared_experts * c->moe_inter_size, H, s->hb, s->hb2);
+                for (int i = 0; i < H; i++) out[i] += eo[i];
+            }
+        }
+        for (int p = 0; p < n_prompt; p++)
+            for (int i = 0; i < H; i++) xs[p * H + i] += mo[p * H + i];
+
+        /* ---- per-layer dumps ---- */
+        if (g_dump) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "prefill_layer%02d_attn_out", l);
+            DUMP_F32(nm, ao, (size_t)n_prompt * H);
+            snprintf(nm, sizeof(nm), "prefill_layer%02d_mlp_out", l);
+            DUMP_F32(nm, mo, (size_t)n_prompt * H);
+            memcpy(&hs[(size_t)(l + 1) * n_prompt * H], xs, (size_t)n_prompt * H * sizeof(float));
+            if (l == 0) {
+                /* layer-0 MLA internals, in the oracle's dump orders.
+                 * q_nope/q_pe are [n_heads, seq, dim] (heads-first, like k_nope). */
+                float *t1 = malloc((size_t)NH * n_prompt * QKN * sizeof(float));
+                for (int h = 0; h < NH; h++)
+                    for (int p = 0; p < n_prompt; p++)
+                        memcpy(&t1[((size_t)h * n_prompt + p) * QKN],
+                               &qall[((size_t)p * NH + h) * QHD], QKN * sizeof(float));
+                DUMP_F32("prefill_layer0_q_nope", t1, (size_t)NH * n_prompt * QKN);
+                float *t2 = malloc((size_t)NH * n_prompt * QKR * sizeof(float));
+                for (int h = 0; h < NH; h++)
+                    for (int p = 0; p < n_prompt; p++)
+                        memcpy(&t2[((size_t)h * n_prompt + p) * QKR],
+                               &qall[((size_t)p * NH + h) * QHD + QKN], QKR * sizeof(float));
+                DUMP_F32("prefill_layer0_q_pe", t2, (size_t)NH * n_prompt * QKR);
+                float *t3 = malloc((size_t)n_prompt * KVL * sizeof(float));
+                float *t4 = malloc((size_t)n_prompt * QKR * sizeof(float));
+                for (int p = 0; p < n_prompt; p++) {    /* c_kv [seq,kv_lora], k_pe [seq,qk_rope] */
+                    memcpy(&t3[(size_t)p * KVL], &kv_l[(size_t)p * KVD], KVL * sizeof(float));
+                    memcpy(&t4[(size_t)p * QKR], &kv_l[(size_t)p * KVD + KVL], QKR * sizeof(float));
+                }
+                DUMP_F32("prefill_layer0_c_kv", t3, (size_t)n_prompt * KVL);
+                DUMP_F32("prefill_layer0_k_pe", t4, (size_t)n_prompt * QKR);
+                DUMP_F32("prefill_layer0_k_nope", knope, (size_t)NH * n_prompt * QKN);
+                DUMP_F32("prefill_layer0_value", value, (size_t)NH * n_prompt * VHD);
+                DUMP_F32("prefill_layer0_attn_scores", scr, (size_t)NH * n_prompt * n_prompt);
+                DUMP_F32("prefill_layer0_attn_weights", wgt, (size_t)NH * n_prompt * n_prompt);
+                free(t1); free(t2); free(t3); free(t4);
+            }
+        }
+    }
+
+    /* final norm + lm_head */
+    if (g_dump) {
+        float *logits_all = malloc((size_t)n_prompt * VOC * sizeof(float));
+        for (int p = 0; p < n_prompt; p++) {
+            rmsnorm(xb, &xs[p * H], w->norm, H, eps);
+            /* HF's final hidden_states entry is post-norm: overwrite hs[n_layers] */
+            memcpy(&hs[((size_t)c->n_layers * n_prompt + p) * H], xb, H * sizeof(float));
+            matmul(&logits_all[(size_t)p * VOC], xb, w->lm_head, VOC, H);
+        }
+        DUMP_F32("prefill_logits", logits_all, (size_t)n_prompt * VOC);
+        DUMP_F32("prefill_hidden_states", hs, (size_t)(c->n_layers + 1) * n_prompt * H);
+        memcpy(s->logits, &logits_all[(size_t)(n_prompt - 1) * VOC], VOC * sizeof(float));
+        free(logits_all);
+    } else {
+        rmsnorm(xb, &xs[(size_t)(n_prompt - 1) * H], w->norm, H, eps);
+        matmul(s->logits, xb, w->lm_head, VOC, H);
+    }
+
+    free(xs); free(xb); free(comp); free(qall); free(knope); free(value);
+    free(scr); free(wgt); free(ctx); free(ao); free(mo); free(eo); free(hs);
+    return s->logits;
+}
+
+/* greedy argmax over logits */
+int sample(float *logits, int vocab_size) {
+    int best = 0; float bv = logits[0];
+    for (int i = 1; i < vocab_size; i++) if (logits[i] > bv) { bv = logits[i]; best = i; }
+    return best;
+}
+
+/* Read up to max int32 tokens from a raw little-endian .i32.bin file. */
+static int read_tokens_i32(const char *path, int *out, int max) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open tokens file: %s\n", path); exit(1); }
+    int32_t buf[4096];
+    size_t n = fread(buf, sizeof(int32_t), max < 4096 ? max : 4096, f);
+    fclose(f);
+    for (size_t i = 0; i < n; i++) out[i] = buf[i];
+    return (int)n;
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr,
-            "Usage: %s <model> <index_json> <shard_dir>\n"
+            "Usage: %s <model> <index_json> <shard_dir> [tokens.i32.bin] [dump_dir]\n"
             "  model: dsv2lite | glm47\n"
-            "Phase 0: loads weights and exits cleanly.\n", argv[0]);
+            "  no tokens file  -> Phase 0 weight-load smoke test\n"
+            "  tokens file     -> unabsorbed prefill; prints argmax of last position\n"
+            "  + dump_dir      -> also writes oracle-named intermediates for validation\n", argv[0]);
         return 1;
     }
     const char *model      = argv[1];
     const char *index_path = argv[2];
     const char *shard_dir  = argv[3];
+    const char *tokens_path = (argc > 4) ? argv[4] : NULL;
+    const char *dump_dir    = (argc > 5) ? argv[5] : NULL;
 
     Transformer t;
     build_transformer(&t, model, index_path, shard_dir);
-
     printf("Loaded %zu tensors\n", st_count(t.store));
     printf("Config: n_layers=%d hidden=%d vocab=%d\n",
            t.config.n_layers, t.config.hidden_size, t.config.vocab_size);
 
-    /* Smoke test: spot-check a few key tensors (query path depends on the model). */
-    printf("embed_tokens[0] = %f\n", bf16_to_f32(t.weights.embed_tokens[0]));
-    if (t.config.q_lora_rank > 0)
-        printf("q_a_proj[0][0]  = %f\n", bf16_to_f32(t.weights.q_a_proj[0][0]));
-    else
-        printf("q_proj[0][0]    = %f\n", bf16_to_f32(t.weights.q_proj[0][0]));
-    printf("W_UK[0][0]      = %f\n", bf16_to_f32(t.weights.W_UK[0][0]));
-    printf("W_UV[0][0]      = %f\n", bf16_to_f32(t.weights.W_UV[0][0]));
-    printf("lm_head[0]      = %f\n", bf16_to_f32(t.weights.lm_head[0]));
+    if (!tokens_path) {
+        printf("Phase 0 — weights loaded; pass a tokens file to run prefill.\n");
+        free_transformer(&t);
+        return 0;
+    }
 
-    (void)generate;  /* unused in Phase 0 */
+    int tokens[4096];
+    int n_prompt = read_tokens_i32(tokens_path, tokens, 4096);
+    printf("Prefill: %d tokens [", n_prompt);
+    for (int i = 0; i < n_prompt; i++) printf("%s%d", i ? ", " : "", tokens[i]);
+    printf("]\n");
+
+    if (dump_dir) run_set_dump(dump_dir);
+    float *logits = forward_unabsorbed(&t, tokens, n_prompt);
+    int next = sample(logits, t.config.vocab_size);
+    printf("next token (argmax last pos) = %d  logit=%.6f\n", next, logits[next]);
+
     free_transformer(&t);
-    printf("Phase 0 complete — weights loaded and freed cleanly.\n");
     return 0;
 }
