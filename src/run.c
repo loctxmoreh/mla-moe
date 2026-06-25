@@ -43,8 +43,13 @@ typedef struct {
     bf16_t **q_a_proj;       /* [n_layers]: [q_lora_rank, hidden_size]               W_DQ  */
     bf16_t **q_b_proj;       /* [n_layers]: [n_heads*qk_head_dim, q_lora_rank]       W_UQ  */
     bf16_t **kv_a_proj;      /* [n_layers]: [kv_lora_rank+qk_rope_head_dim, hidden]  W_DKV */
-    bf16_t **W_UK;           /* [n_layers]: [n_heads*qk_nope_head_dim, kv_lora_rank] split from kv_b_proj */
-    bf16_t **W_UV;           /* [n_layers]: [n_heads*v_head_dim, kv_lora_rank]       split from kv_b_proj */
+    /* Per-head MLA up-projections, split from kv_b_proj (head-INTERLEAVED, zero-copy).
+     * kv_b_proj.weight is [n_heads*(qk_nope_head_dim+v_head_dim), kv_lora_rank]; per
+     * head the rows are [W_UK_h (qk_nope) | W_UV_h (v_head)]. W_UK[l]/W_UV[l] point at
+     * head 0; both use the SAME per-head stride (qk_nope_head_dim+v_head_dim)*kv_lora_rank:
+     * head h -> W_UK[l] + h*stride, W_UV[l] + h*stride. */
+    bf16_t **W_UK;           /* [n_layers]: head 0's [qk_nope_head_dim, kv_lora_rank] */
+    bf16_t **W_UV;           /* [n_layers]: head 0's [v_head_dim,       kv_lora_rank] */
     bf16_t **o_proj;         /* [n_layers]: [hidden_size, n_heads*v_head_dim]        */
 
     /* Per-layer RMSNorm weights */
@@ -182,12 +187,13 @@ static void build_model_weights(Transformer *t) {
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.kv_a_proj_with_mqa.weight", l);
         w->kv_a_proj[l] = must_get(s, name);
 
-        /* split kv_b_proj into W_UK and W_UV at load time — no copy */
+        /* Split kv_b_proj into W_UK/W_UV at head 0 — no copy. Layout is head-
+         * INTERLEAVED ([W_UK_h | W_UV_h] per head), so W_UV starts after head 0's
+         * W_UK, NOT after all heads' W_UK. Per-head stride is applied at use. */
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.kv_b_proj.weight", l);
         bf16_t *kv_b = must_get(s, name);
-        size_t uk_elems = (size_t)c->n_heads * c->qk_nope_head_dim * c->kv_lora_rank;
         w->W_UK[l] = kv_b;
-        w->W_UV[l] = kv_b + uk_elems;
+        w->W_UV[l] = kv_b + (size_t)c->qk_nope_head_dim * c->kv_lora_rank;
 
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
         w->o_proj[l] = must_get(s, name);
