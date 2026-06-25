@@ -506,6 +506,45 @@ static void softmax(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] /= sum;
 }
 
+/* One token's FFN, shared by prefill and decode. xn is the post_attn_norm'd
+ * hidden; writes out[hidden]. Dense SwiGLU for l < first_k_dense, else
+ * softmax-greedy top-k routed experts + shared expert. When topk_idx/topk_w are
+ * non-NULL (MoE layers) the chosen experts are returned; s->moe_logits is left
+ * holding the full router softmax (for dumping). */
+static void ffn_compute(const Config *c, ModelWeights *w, RunState *s, int l,
+                        const float *xn, float *out, int *topk_idx, float *topk_w) {
+    const int H = c->hidden_size;
+    if (l < c->first_k_dense) {
+        swiglu(out, xn, w->dense_gate[l], w->dense_up[l], w->dense_down[l],
+               c->dense_inter_size, H, s->hb, s->hb2);
+        return;
+    }
+    matmul(s->moe_logits, xn, w->moe_gate[l], c->n_routed_experts, H);
+    softmax(s->moe_logits, c->n_routed_experts);
+    int  K = c->n_experts_per_tok;
+    int  idx[16]; float wts[16];        /* K <= 16 */
+    char used[1024] = {0};              /* n_routed <= 1024 */
+    for (int r = 0; r < K; r++) {
+        int best = -1; float bv = -INFINITY;
+        for (int e = 0; e < c->n_routed_experts; e++) {
+            if (used[e]) continue;
+            if (s->moe_logits[e] > bv) { bv = s->moe_logits[e]; best = e; }
+        }
+        used[best] = 1; idx[r] = best; wts[r] = bv;   /* routed_scaling=1, no norm */
+    }
+    for (int i = 0; i < H; i++) out[i] = 0.0f;
+    for (int r = 0; r < K; r++) {
+        swiglu(s->expert_out, xn, w->expert_gate[l][idx[r]], w->expert_up[l][idx[r]],
+               w->expert_down[l][idx[r]], c->moe_inter_size, H, s->hb, s->hb2);
+        for (int i = 0; i < H; i++) out[i] += wts[r] * s->expert_out[i];
+    }
+    /* shared experts: one MLP of width n_shared * moe_inter */
+    swiglu(s->expert_out, xn, w->shared_gate[l], w->shared_up[l], w->shared_down[l],
+           c->n_shared_experts * c->moe_inter_size, H, s->hb, s->hb2);
+    for (int i = 0; i < H; i++) out[i] += s->expert_out[i];
+    if (topk_idx) for (int r = 0; r < K; r++) { topk_idx[r] = idx[r]; topk_w[r] = wts[r]; }
+}
+
 /* Whole-prompt prefill. Returns logits at the LAST position (RunState.logits).
  * With g_dump set, also writes the oracle-named intermediates for validation. */
 float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
@@ -539,7 +578,6 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
     float *ctx   = malloc((size_t)NH * VHD * sizeof(float));
     float *ao    = malloc((size_t)n_prompt * H * sizeof(float));   /* attn module out */
     float *mo    = malloc((size_t)n_prompt * H * sizeof(float));   /* mlp module out */
-    float *eo    = malloc(H * sizeof(float));                      /* one expert out */
     /* hidden_states snapshot [n_layers+1][n_prompt][H] (dump only) */
     float *hs = g_dump ? malloc((size_t)(c->n_layers + 1) * n_prompt * H * sizeof(float)) : NULL;
 
@@ -609,50 +647,25 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
         for (int p = 0; p < n_prompt; p++)
             for (int i = 0; i < H; i++) xs[p * H + i] += ao[p * H + i];
 
-        /* ---- FFN: dense for l < first_k_dense, else MoE ---- */
+        /* ---- FFN: dense for l < first_k_dense, else MoE (shared helper) ---- */
+        int dump_router = g_dump && (l == c->first_k_dense);
         for (int p = 0; p < n_prompt; p++) {
             rmsnorm(xb, &xs[p * H], w->post_attn_norm[l], H, eps);
-            float *out = &mo[(size_t)p * H];
-            if (l < c->first_k_dense) {
-                swiglu(out, xb, w->dense_gate[l], w->dense_up[l], w->dense_down[l],
-                       c->dense_inter_size, H, s->hb, s->hb2);
-            } else {
-                /* router: softmax over experts, greedy top-k */
-                matmul(s->moe_logits, xb, w->moe_gate[l], c->n_routed_experts, H);
-                softmax(s->moe_logits, c->n_routed_experts);
-                int   K = c->n_experts_per_tok;
-                int   idx[16]; float wts[16];   /* K <= 16 */
-                char  used[1024] = {0};         /* n_routed <= 1024 */
-                for (int r = 0; r < K; r++) {
-                    int best = -1; float bv = -INFINITY;
-                    for (int e = 0; e < c->n_routed_experts; e++) {
-                        if (used[e]) continue;
-                        if (s->moe_logits[e] > bv) { bv = s->moe_logits[e]; best = e; }
-                    }
-                    used[best] = 1; idx[r] = best; wts[r] = bv;   /* routed_scaling=1, no norm */
+            int ti_p[16]; float tw_p[16];
+            ffn_compute(c, w, s, l, xb, &mo[(size_t)p * H],
+                        dump_router ? ti_p : NULL, dump_router ? tw_p : NULL);
+            /* dump first MoE layer's router (oracle: prefill_moe1_*) */
+            if (dump_router) {
+                static float rs[8 * 1024]; static int ti[8 * 16]; static float tw[8 * 16];
+                int K = c->n_experts_per_tok;
+                memcpy(&rs[(size_t)p * c->n_routed_experts], s->moe_logits,
+                       c->n_routed_experts * sizeof(float));   /* router softmax */
+                for (int r = 0; r < K; r++) { ti[p * K + r] = ti_p[r]; tw[p * K + r] = tw_p[r]; }
+                if (p == n_prompt - 1) {
+                    DUMP_F32("prefill_moe1_router_scores", rs, (size_t)n_prompt * c->n_routed_experts);
+                    DUMP_I32("prefill_moe1_topk_idx", ti, (size_t)n_prompt * K);
+                    DUMP_F32("prefill_moe1_topk_w",   tw, (size_t)n_prompt * K);
                 }
-                /* dump first MoE layer's router (oracle: prefill_moe1_*) */
-                if (g_dump && l == c->first_k_dense) {
-                    static float rs[8 * 1024]; static int ti[8 * 16]; static float tw[8 * 16];
-                    memcpy(&rs[(size_t)p * c->n_routed_experts], s->moe_logits,
-                           c->n_routed_experts * sizeof(float));
-                    for (int r = 0; r < K; r++) { ti[p * K + r] = idx[r]; tw[p * K + r] = wts[r]; }
-                    if (p == n_prompt - 1) {
-                        DUMP_F32("prefill_moe1_router_scores", rs, (size_t)n_prompt * c->n_routed_experts);
-                        DUMP_I32("prefill_moe1_topk_idx", ti, (size_t)n_prompt * K);
-                        DUMP_F32("prefill_moe1_topk_w",   tw, (size_t)n_prompt * K);
-                    }
-                }
-                for (int i = 0; i < H; i++) out[i] = 0.0f;
-                for (int r = 0; r < K; r++) {
-                    swiglu(eo, xb, w->expert_gate[l][idx[r]], w->expert_up[l][idx[r]],
-                           w->expert_down[l][idx[r]], c->moe_inter_size, H, s->hb, s->hb2);
-                    for (int i = 0; i < H; i++) out[i] += wts[r] * eo[i];
-                }
-                /* shared experts: one MLP of width n_shared * moe_inter */
-                swiglu(eo, xb, w->shared_gate[l], w->shared_up[l], w->shared_down[l],
-                       c->n_shared_experts * c->moe_inter_size, H, s->hb, s->hb2);
-                for (int i = 0; i < H; i++) out[i] += eo[i];
             }
         }
         for (int p = 0; p < n_prompt; p++)
@@ -717,7 +730,137 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
     }
 
     free(xs); free(xb); free(comp); free(qall); free(knope); free(value);
-    free(scr); free(wgt); free(ctx); free(ao); free(mo); free(eo); free(hs);
+    free(scr); free(wgt); free(ctx); free(ao); free(mo); free(hs);
+    return s->logits;
+}
+
+/* Single-token decode via the ABSORBED MLA path. Reads the latent KV cache
+ * filled by prefill (and prior decode steps), appends this position's c_kv/k_pe,
+ * and attends in latent space: W_UK is folded into the query and W_UV into the
+ * output, so no per-head K/V is ever materialized. Mathematically identical to
+ * forward_unabsorbed for the same inputs; cheaper at q_len=1. Returns logits.
+ * With g_dump set, writes the layer-0 decode_* internals (oracle-named). */
+float *forward_absorbed(Transformer *t, int token, int pos) {
+    const Config *c = &t->config;
+    ModelWeights *w = &t->weights;
+    RunState     *s = &t->state;
+    const float  *inv_freq = t->rope_inv_freq;
+
+    const int H   = c->hidden_size;
+    const int NH  = c->n_heads;
+    const int QKN = c->qk_nope_head_dim, QKR = c->qk_rope_head_dim;
+    const int QHD = QKN + QKR;
+    const int VHD = c->v_head_dim;
+    const int KVL = c->kv_lora_rank;
+    const int KVD = KVL + QKR;
+    const int VOC = c->vocab_size;
+    const float scale = c->softmax_scale, eps = c->rms_eps;
+    const size_t kv_stride = (size_t)(QKN + VHD) * KVL;
+    const size_t cache_row = (size_t)c->max_seq_len * KVD;
+    const int kv_len = pos + 1;                /* keys: [0..pos] inclusive */
+
+    float *x    = malloc(H * sizeof(float));
+    float *xb   = malloc(H * sizeof(float));
+    float *comp = malloc(KVD * sizeof(float));
+    float *q    = malloc((size_t)NH * QHD * sizeof(float));
+    float *qabs = malloc(KVL * sizeof(float));            /* q_absorbed (per head) */
+    float *score= malloc(kv_len * sizeof(float));
+    float *clat = malloc(KVL * sizeof(float));            /* latent context (per head) */
+    float *ctx  = malloc((size_t)NH * VHD * sizeof(float));
+    float *ao   = malloc(H * sizeof(float));
+    float *mo   = malloc(H * sizeof(float));
+    /* layer-0 decode dump scratch (heads-major, like the oracle) */
+    float *d_qabs = g_dump ? malloc((size_t)NH * KVL * sizeof(float)) : NULL;
+    float *d_clat = g_dump ? malloc((size_t)NH * KVL * sizeof(float)) : NULL;
+    float *d_attn = g_dump ? malloc((size_t)NH * kv_len * sizeof(float)) : NULL;
+
+    for (int i = 0; i < H; i++) x[i] = bf16_to_f32(w->embed_tokens[(size_t)token * H + i]);
+
+    for (int l = 0; l < c->n_layers; l++) {
+        float *kv_l = &s->kv_cache[(size_t)l * cache_row];
+
+        rmsnorm(xb, x, w->input_layernorm[l], H, eps);
+        matmul(q, xb, w->q_proj[l], NH * QHD, H);
+        for (int h = 0; h < NH; h++)
+            rope_apply(&q[(size_t)h * QHD + QKN], pos, inv_freq, QKR);
+
+        /* append this position's latent KV */
+        matmul(comp, xb, w->kv_a_proj[l], KVD, H);
+        float *cache_p = &kv_l[(size_t)pos * KVD];
+        rmsnorm(cache_p, comp, w->kv_a_layernorm[l], KVL, eps);
+        memcpy(cache_p + KVL, comp + KVL, QKR * sizeof(float));
+        rope_apply(cache_p + KVL, pos, inv_freq, QKR);
+
+        for (int h = 0; h < NH; h++) {
+            const bf16_t *WUK = w->W_UK[l] + (size_t)h * kv_stride;
+            const bf16_t *WUV = w->W_UV[l] + (size_t)h * kv_stride;
+            const float  *qnope = &q[(size_t)h * QHD];
+            const float  *qpe   = qnope + QKN;
+
+            /* q_absorbed[r] = sum_d q_nope[d] * W_UK[d,r]  (fold W_UK into query) */
+            for (int r = 0; r < KVL; r++) qabs[r] = 0.0f;
+            for (int d = 0; d < QKN; d++) {
+                float qd = qnope[d];
+                const bf16_t *row = WUK + (size_t)d * KVL;
+                for (int r = 0; r < KVL; r++) qabs[r] += qd * bf16_to_f32(row[r]);
+            }
+            /* scores in latent space: q_absorbed·c_kv + q_pe·k_pe */
+            for (int k = 0; k < kv_len; k++) {
+                const float *ckv  = &kv_l[(size_t)k * KVD];
+                const float *kpe  = ckv + KVL;
+                float sn = 0.0f, sp = 0.0f;
+                for (int r = 0; r < KVL; r++) sn += qabs[r] * ckv[r];
+                for (int d = 0; d < QKR; d++) sp += qpe[d]  * kpe[d];
+                score[k] = (sn + sp) * scale;
+            }
+            softmax(score, kv_len);
+            /* latent context, then up-project with W_UV */
+            for (int r = 0; r < KVL; r++) clat[r] = 0.0f;
+            for (int k = 0; k < kv_len; k++) {
+                float a = score[k];
+                const float *ckv = &kv_l[(size_t)k * KVD];
+                for (int r = 0; r < KVL; r++) clat[r] += a * ckv[r];
+            }
+            matmul(&ctx[(size_t)h * VHD], clat, WUV, VHD, KVL);
+
+            if (g_dump && l == 0) {
+                memcpy(&d_qabs[(size_t)h * KVL], qabs, KVL * sizeof(float));
+                memcpy(&d_clat[(size_t)h * KVL], clat, KVL * sizeof(float));
+                memcpy(&d_attn[(size_t)h * kv_len], score, kv_len * sizeof(float));
+            }
+        }
+        matmul(ao, ctx, w->o_proj[l], H, NH * VHD);
+        for (int i = 0; i < H; i++) x[i] += ao[i];
+
+        rmsnorm(xb, x, w->post_attn_norm[l], H, eps);
+        ffn_compute(c, w, s, l, xb, mo, NULL, NULL);
+        for (int i = 0; i < H; i++) x[i] += mo[i];
+
+        if (g_dump && l == 0) {
+            DUMP_F32("decode_layer0_q_absorbed", d_qabs, (size_t)NH * KVL);
+            DUMP_F32("decode_layer0_ctx_latent", d_clat, (size_t)NH * KVL);
+            DUMP_F32("decode_layer0_attn_weights", d_attn, (size_t)NH * kv_len);
+            DUMP_F32("decode_layer0_attn_out", ao, H);
+            /* the full latent cache (prefill + this step), heads-shared */
+            float *cc = malloc((size_t)kv_len * KVL * sizeof(float));
+            float *kk = malloc((size_t)kv_len * QKR * sizeof(float));
+            for (int k = 0; k < kv_len; k++) {
+                memcpy(&cc[(size_t)k * KVL], &kv_l[(size_t)k * KVD], KVL * sizeof(float));
+                memcpy(&kk[(size_t)k * QKR], &kv_l[(size_t)k * KVD + KVL], QKR * sizeof(float));
+            }
+            DUMP_F32("decode_layer0_c_kv_cache", cc, (size_t)kv_len * KVL);
+            DUMP_F32("decode_layer0_k_pe_cache", kk, (size_t)kv_len * QKR);
+            free(cc); free(kk);
+        }
+    }
+
+    rmsnorm(xb, x, w->norm, H, eps);
+    matmul(s->logits, xb, w->lm_head, VOC, H);
+    if (g_dump) DUMP_F32("decode_logits", s->logits, VOC);
+
+    free(x); free(xb); free(comp); free(q); free(qabs); free(score);
+    free(clat); free(ctx); free(ao); free(mo);
+    free(d_qabs); free(d_clat); free(d_attn);
     return s->logits;
 }
 
@@ -739,14 +882,31 @@ static int read_tokens_i32(const char *path, int *out, int max) {
     return (int)n;
 }
 
+/* Two-path generation: one unabsorbed prefill over the prompt, then a greedy
+ * absorbed-decode loop. Prints generated token ids (no detokenizer in C yet). */
+static void generate(Transformer *t, const int *prompt, int n_prompt, int max_new) {
+    float *logits = forward_unabsorbed(t, prompt, n_prompt);
+    int tok = sample(logits, t->config.vocab_size);
+    int pos = n_prompt;
+    printf("generated:");
+    for (int i = 0; i < max_new; i++) {
+        printf(" %d", tok);
+        logits = forward_absorbed(t, tok, pos);
+        tok = sample(logits, t->config.vocab_size);
+        pos++;
+    }
+    printf(" %d\n", tok);
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr,
             "Usage: %s <model> <index_json> <shard_dir> [tokens.i32.bin] [dump_dir]\n"
             "  model: dsv2lite | glm47\n"
             "  no tokens file  -> Phase 0 weight-load smoke test\n"
-            "  tokens file     -> unabsorbed prefill; prints argmax of last position\n"
-            "  + dump_dir      -> also writes oracle-named intermediates for validation\n", argv[0]);
+            "  tokens file     -> prefill + greedy absorbed decode (prints token ids)\n"
+            "  + dump_dir      -> prefill + ONE decode step, writing oracle-named\n"
+            "                     prefill_*/decode_* intermediates for validation\n", argv[0]);
         return 1;
     }
     const char *model      = argv[1];
@@ -769,14 +929,23 @@ int main(int argc, char *argv[]) {
 
     int tokens[4096];
     int n_prompt = read_tokens_i32(tokens_path, tokens, 4096);
-    printf("Prefill: %d tokens [", n_prompt);
+    printf("Prompt: %d tokens [", n_prompt);
     for (int i = 0; i < n_prompt; i++) printf("%s%d", i ? ", " : "", tokens[i]);
     printf("]\n");
 
-    if (dump_dir) run_set_dump(dump_dir);
-    float *logits = forward_unabsorbed(&t, tokens, n_prompt);
-    int next = sample(logits, t.config.vocab_size);
-    printf("next token (argmax last pos) = %d  logit=%.6f\n", next, logits[next]);
+    if (dump_dir) {
+        /* validation scenario: prefill, then exactly one absorbed-decode step
+         * (mirrors gen_oracle: feed the prefill argmax at position n_prompt). */
+        run_set_dump(dump_dir);
+        float *logits = forward_unabsorbed(&t, tokens, n_prompt);
+        int next = sample(logits, t.config.vocab_size);
+        printf("prefill argmax = %d  logit=%.6f\n", next, logits[next]);
+        float *dlog = forward_absorbed(&t, next, n_prompt);
+        int next2 = sample(dlog, t.config.vocab_size);
+        printf("decode  argmax = %d  logit=%.6f\n", next2, dlog[next2]);
+    } else {
+        generate(&t, tokens, n_prompt, 16);
+    }
 
     free_transformer(&t);
     return 0;
