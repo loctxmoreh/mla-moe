@@ -1,7 +1,7 @@
 /* MLA-MOE inference entry point; structure follows llama2.c.
  * forward_unabsorbed() (whole-prompt prefill) and forward_absorbed() (one-token
  * decode) are both oracle-validated for dsv2lite AND glm47 within tol=2e-3.
- * Config still hardcoded per model (config.json-driven later). */
+ * Config (incl. model family) is read from <model_dir>/config.json. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,9 +9,8 @@
 
 #include "tensor.h"
 #include "safetensors_loader.h"
-#include "model_config.h"
 
-/* Mirrors llama2.c's Config; hardcoded from model_config.h. */
+/* Mirrors llama2.c's Config; populated from config.json at load time. */
 typedef struct {
     int   n_layers;
     int   hidden_size;
@@ -329,76 +328,106 @@ static void free_model_weights(ModelWeights *w, int n_layers) {
     free(w->expert_gate); free(w->expert_up); free(w->expert_down);
 }
 
-/* Hardcoded per-model config (config.json-driven later). */
-static Config config_for(const char *model) {
-    if (strcmp(model, "dsv2lite") == 0) {
-        return (Config){
-            .n_layers           = DSV2LITE_N_LAYERS,
-            .hidden_size        = DSV2LITE_HIDDEN,
-            .n_heads            = DSV2LITE_N_HEADS,
-            .n_kv_heads         = DSV2LITE_N_KV_HEADS,
-            .q_lora_rank        = DSV2LITE_Q_LORA_RANK,
-            .first_k_dense      = DSV2LITE_FIRST_K_DENSE,
-            .kv_lora_rank       = DSV2LITE_KV_LORA_RANK,
-            .qk_rope_head_dim   = DSV2LITE_QK_ROPE_HEAD_DIM,
-            .qk_nope_head_dim   = DSV2LITE_QK_NOPE_HEAD_DIM,
-            .v_head_dim         = DSV2LITE_V_HEAD_DIM,
-            .n_routed_experts   = DSV2LITE_N_ROUTED_EXPERTS,
-            .n_shared_experts   = DSV2LITE_N_SHARED_EXPERTS,
-            .n_experts_per_tok  = DSV2LITE_N_EXPERTS_PER_TOK,
-            .dense_inter_size   = DSV2LITE_DENSE_INTER_SIZE,
-            .moe_inter_size     = DSV2LITE_MOE_INTER_SIZE,
-            .vocab_size         = DSV2LITE_VOCAB_SIZE,
-            .max_seq_len        = DSV2LITE_MAX_SEQ_LEN,
-            .rms_eps            = DSV2LITE_RMS_EPS,
-            .mla_norm_eps       = DSV2LITE_RMS_EPS,   /* dsv2: all norms 1e-6 */
-            /* softmax_scale = q_head_dim**-0.5 = (qk_nope+qk_rope)**-0.5 */
-            .softmax_scale      = 1.0f / sqrtf(DSV2LITE_QK_NOPE_HEAD_DIM + DSV2LITE_QK_ROPE_HEAD_DIM),
-            .rope_theta         = DSV2LITE_ROPE_THETA,
-            .rope_factor        = DSV2LITE_ROPE_FACTOR,
-            .rope_beta_fast     = DSV2LITE_ROPE_BETA_FAST,
-            .rope_beta_slow     = DSV2LITE_ROPE_BETA_SLOW,
-            .rope_orig_max      = DSV2LITE_ROPE_ORIG_MAX,
-            .rope_interleaved   = 0,
-            .router_sigmoid     = 0,     /* softmax-greedy */
-            .norm_topk          = 0,
-            .routed_scaling     = 1.0f,
-        };
+/* ---- minimal config.json reader -----------------------------------------
+ * config.json is flat JSON (one nested object, rope_scaling). We only need
+ * scalar lookups by key, so a substring scan suffices — no real parser. Each
+ * search key includes its quotes, so e.g. "factor" never matches inside
+ * "routed_scaling_factor" and "max_position_embeddings" never matches inside
+ * "original_max_position_embeddings". */
+static char *read_text_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)n + 1);
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "read %s\n", path); exit(1); }
+    buf[n] = '\0'; fclose(f);
+    return buf;
+}
+
+/* Pointer to the first char of key's value (past `"key":` and whitespace), or NULL. */
+static const char *json_value(const char *buf, const char *key) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(buf, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    while (*p && *p != ':') p++;
+    if (*p == ':') p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+static long json_int(const char *buf, const char *key, long dflt) {
+    const char *p = json_value(buf, key);
+    return (!p || *p == 'n') ? dflt : strtol(p, NULL, 10);   /* 'n' => null */
+}
+static double json_double(const char *buf, const char *key, double dflt) {
+    const char *p = json_value(buf, key);
+    return (!p || *p == 'n') ? dflt : strtod(p, NULL);
+}
+static int json_bool(const char *buf, const char *key, int dflt) {
+    const char *p = json_value(buf, key);
+    return p ? (*p == 't') : dflt;
+}
+static int json_str_is(const char *buf, const char *key, const char *val) {
+    const char *p = json_value(buf, key);
+    if (!p || *p != '"') return 0;
+    p++;
+    size_t n = strlen(val);
+    return strncmp(p, val, n) == 0 && p[n] == '"';
+}
+
+/* Cap on the latent KV cache length (config max_position_embeddings is huge:
+ * 163840 / 202752). Prompt + generated tokens must fit under this. */
+#define KV_CACHE_CAP 4096
+
+/* Build Config from <model_dir>/config.json. Model-family behavior is derived,
+ * not hardcoded: rope layout from model_type, router flavor from topk_method,
+ * YaRN params from rope_scaling (absent => plain rope). */
+static Config config_from_json(const char *model_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    char *b = read_text_file(path);
+
+    Config c = {0};
+    c.n_layers          = (int)json_int(b, "num_hidden_layers", 0);
+    c.hidden_size       = (int)json_int(b, "hidden_size", 0);
+    c.n_heads           = (int)json_int(b, "num_attention_heads", 0);
+    c.n_kv_heads        = c.n_heads;                       /* MLA: no GQA */
+    c.q_lora_rank       = (int)json_int(b, "q_lora_rank", 0);   /* null => 0 (no q-LoRA) */
+    c.first_k_dense     = (int)json_int(b, "first_k_dense_replace", 0);
+    c.kv_lora_rank      = (int)json_int(b, "kv_lora_rank", 0);
+    c.qk_rope_head_dim  = (int)json_int(b, "qk_rope_head_dim", 0);
+    c.qk_nope_head_dim  = (int)json_int(b, "qk_nope_head_dim", 0);
+    c.v_head_dim        = (int)json_int(b, "v_head_dim", 0);
+    c.n_routed_experts  = (int)json_int(b, "n_routed_experts", 0);
+    c.n_shared_experts  = (int)json_int(b, "n_shared_experts", 0);
+    c.n_experts_per_tok = (int)json_int(b, "num_experts_per_tok", 0);
+    c.dense_inter_size  = (int)json_int(b, "intermediate_size", 0);
+    c.moe_inter_size    = (int)json_int(b, "moe_intermediate_size", 0);
+    c.vocab_size        = (int)json_int(b, "vocab_size", 0);
+    long maxpos         = json_int(b, "max_position_embeddings", KV_CACHE_CAP);
+    c.max_seq_len       = maxpos < KV_CACHE_CAP ? (int)maxpos : KV_CACHE_CAP;
+    c.rms_eps           = (float)json_double(b, "rms_norm_eps", 1e-5);
+    c.mla_norm_eps      = 1e-6f;   /* q_a/kv_a RMSNorm class default — not in config.json */
+    c.softmax_scale     = 1.0f / sqrtf((float)(c.qk_nope_head_dim + c.qk_rope_head_dim));
+    c.rope_theta        = (float)json_double(b, "rope_theta", 10000.0);
+    /* rope_scaling (YaRN): present => factor from it; absent/null => plain (factor 1).
+     * "factor"/"beta_*"/"original_max_position_embeddings" only occur inside it. */
+    c.rope_factor       = (float)json_double(b, "factor", 1.0);
+    c.rope_beta_fast    = (float)json_double(b, "beta_fast", 32.0);
+    c.rope_beta_slow    = (float)json_double(b, "beta_slow", 1.0);
+    c.rope_orig_max     = (float)json_double(b, "original_max_position_embeddings", 4096.0);
+    c.rope_interleaved  = json_str_is(b, "model_type", "glm4_moe_lite");  /* else complex */
+    c.router_sigmoid    = json_str_is(b, "topk_method", "noaux_tc");      /* else softmax-greedy */
+    c.norm_topk         = json_bool(b, "norm_topk_prob", 0);
+    c.routed_scaling    = (float)json_double(b, "routed_scaling_factor", 1.0);
+    free(b);
+
+    if (c.n_layers <= 0 || c.hidden_size <= 0 || c.kv_lora_rank <= 0) {
+        fprintf(stderr, "config_from_json: missing/invalid fields in %s\n", path);
+        exit(1);
     }
-    if (strcmp(model, "glm47") == 0) {
-        return (Config){
-            .n_layers           = GLM47_N_LAYERS,
-            .hidden_size        = GLM47_HIDDEN,
-            .n_heads            = GLM47_N_HEADS,
-            .n_kv_heads         = GLM47_N_KV_HEADS,
-            .q_lora_rank        = GLM47_Q_LORA_RANK,
-            .first_k_dense      = GLM47_FIRST_K_DENSE,
-            .kv_lora_rank       = GLM47_KV_LORA_RANK,
-            .qk_rope_head_dim   = GLM47_QK_ROPE_HEAD_DIM,
-            .qk_nope_head_dim   = GLM47_QK_NOPE_HEAD_DIM,
-            .v_head_dim         = GLM47_V_HEAD_DIM,
-            .n_routed_experts   = GLM47_N_ROUTED_EXPERTS,
-            .n_shared_experts   = GLM47_N_SHARED_EXPERTS,
-            .n_experts_per_tok  = GLM47_N_EXPERTS_PER_TOK,
-            .dense_inter_size   = GLM47_DENSE_INTER_SIZE,
-            .moe_inter_size     = GLM47_MOE_INTER_SIZE,
-            .vocab_size         = GLM47_VOCAB_SIZE,
-            .max_seq_len        = GLM47_MAX_SEQ_LEN,
-            .rms_eps            = 1e-5f,    /* decoder norms (config rms_norm_eps) */
-            .mla_norm_eps       = 1e-6f,    /* q_a/kv_a layernorms (verified vs oracle) */
-            .softmax_scale      = 1.0f / sqrtf(GLM47_QK_NOPE_HEAD_DIM + GLM47_QK_ROPE_HEAD_DIM),
-            /* GLM: plain RoPE (rope_scaling=null) => factor=1 degenerates the YaRN
-             * builder to inv_freq = 1/theta^(2j/dim); theta=1e6; interleaved layout. */
-            .rope_theta = 1000000.0f, .rope_factor = 1.0f,
-            .rope_beta_fast = 32.0f, .rope_beta_slow = 1.0f, .rope_orig_max = 4096.0f,
-            .rope_interleaved   = 1,
-            .router_sigmoid     = 1,     /* noaux_tc: sigmoid + e_score_correction_bias */
-            .norm_topk          = 1,
-            .routed_scaling     = 1.8f,
-        };
-    }
-    fprintf(stderr, "unknown model '%s' (expected: dsv2lite | glm47)\n", model);
-    exit(1);
+    return c;
 }
 
 /* DeepSeek-V2 YaRN inv_freq: blends interpolated/extrapolated freqs over a
@@ -434,12 +463,14 @@ static float *build_rope_inv_freq(const Config *c) {
     return inv;
 }
 
-void build_transformer(Transformer *t, const char *model,
-                       const char *index_path, const char *shard_dir) {
-    /* 1. load config (hardcoded per model) */
-    t->config = config_for(model);
+/* model_dir holds config.json, model.safetensors.index.json, and the shards. */
+void build_transformer(Transformer *t, const char *model_dir) {
+    char index_path[1024];
+    snprintf(index_path, sizeof(index_path), "%s/model.safetensors.index.json", model_dir);
+    /* 1. load config from config.json */
+    t->config = config_from_json(model_dir);
     /* 2. mmap all shards */
-    t->store = st_load_sharded(index_path, shard_dir);
+    t->store = st_load_sharded(index_path, model_dir);
     /* 3. resolve tensor names → bf16_t* pointers */
     build_model_weights(t);
     /* 4. allocate run-state buffers */
@@ -987,21 +1018,20 @@ static void generate(Transformer *t, const int *prompt, int n_prompt, int max_ne
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 4) {
+    if (argc < 2) {
         fprintf(stderr,
-            "Usage: %s <model> <index_json> <shard_dir> [tokens.i32.bin] [dump_dir]\n"
-            "  model: dsv2lite | glm47\n"
+            "Usage: %s <model_dir> [tokens.i32.bin] [dump_dir]\n"
+            "  model_dir: holds config.json, model.safetensors.index.json, shards\n"
+            "             (model family auto-detected from config.json)\n"
             "  no tokens file  -> weight-load smoke test\n"
             "  tokens file     -> prefill + greedy absorbed decode (prints token ids)\n"
             "  + dump_dir      -> prefill + ONE decode step, writing oracle-named\n"
             "                     prefill_*/decode_* intermediates for validation\n", argv[0]);
         return 1;
     }
-    const char *model      = argv[1];
-    const char *index_path = argv[2];
-    const char *shard_dir  = argv[3];
-    const char *tokens_path = (argc > 4) ? argv[4] : NULL;
-    const char *dump_dir    = (argc > 5) ? argv[5] : NULL;
+    const char *model_dir   = argv[1];
+    const char *tokens_path = (argc > 2) ? argv[2] : NULL;
+    const char *dump_dir    = (argc > 3) ? argv[3] : NULL;
 #ifndef MLA_ENABLE_DUMP
     if (dump_dir)
         fprintf(stderr, "note: dump_dir given but dumps not compiled in "
@@ -1009,7 +1039,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     Transformer t;
-    build_transformer(&t, model, index_path, shard_dir);
+    build_transformer(&t, model_dir);
     printf("Loaded %zu tensors\n", st_count(t.store));
     printf("Config: n_layers=%d hidden=%d vocab=%d\n",
            t.config.n_layers, t.config.hidden_size, t.config.vocab_size);
