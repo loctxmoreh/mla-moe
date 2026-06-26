@@ -9,6 +9,7 @@
 
 #include "tensor.h"
 #include "safetensors_loader.h"
+#include "cJSON.h"
 
 /* Mirrors llama2.c's Config; populated from config.json at load time. */
 typedef struct {
@@ -328,12 +329,8 @@ static void free_model_weights(ModelWeights *w, int n_layers) {
     free(w->expert_gate); free(w->expert_up); free(w->expert_down);
 }
 
-/* ---- minimal config.json reader -----------------------------------------
- * config.json is flat JSON (one nested object, rope_scaling). We only need
- * scalar lookups by key, so a substring scan suffices — no real parser. Each
- * search key includes its quotes, so e.g. "factor" never matches inside
- * "routed_scaling_factor" and "max_position_embeddings" never matches inside
- * "original_max_position_embeddings". */
+/* ---- config.json reader (vendored cJSON) --------------------------------- */
+
 static char *read_text_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
@@ -344,36 +341,22 @@ static char *read_text_file(const char *path) {
     return buf;
 }
 
-/* Pointer to the first char of key's value (past `"key":` and whitespace), or NULL. */
-static const char *json_value(const char *buf, const char *key) {
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(buf, pat);
-    if (!p) return NULL;
-    p += strlen(pat);
-    while (*p && *p != ':') p++;
-    if (*p == ':') p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    return p;
+/* typed getters over a cJSON object; all tolerate missing keys / null / NULL obj */
+static int cfg_int(const cJSON *o, const char *k, int dflt) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return cJSON_IsNumber(v) ? (int)v->valuedouble : dflt;
 }
-static long json_int(const char *buf, const char *key, long dflt) {
-    const char *p = json_value(buf, key);
-    return (!p || *p == 'n') ? dflt : strtol(p, NULL, 10);   /* 'n' => null */
+static double cfg_double(const cJSON *o, const char *k, double dflt) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return cJSON_IsNumber(v) ? v->valuedouble : dflt;
 }
-static double json_double(const char *buf, const char *key, double dflt) {
-    const char *p = json_value(buf, key);
-    return (!p || *p == 'n') ? dflt : strtod(p, NULL);
+static int cfg_bool(const cJSON *o, const char *k, int dflt) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return cJSON_IsBool(v) ? cJSON_IsTrue(v) : dflt;
 }
-static int json_bool(const char *buf, const char *key, int dflt) {
-    const char *p = json_value(buf, key);
-    return p ? (*p == 't') : dflt;
-}
-static int json_str_is(const char *buf, const char *key, const char *val) {
-    const char *p = json_value(buf, key);
-    if (!p || *p != '"') return 0;
-    p++;
-    size_t n = strlen(val);
-    return strncmp(p, val, n) == 0 && p[n] == '"';
+static int cfg_str_is(const cJSON *o, const char *k, const char *val) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return cJSON_IsString(v) && v->valuestring && strcmp(v->valuestring, val) == 0;
 }
 
 /* Cap on the latent KV cache length (config max_position_embeddings is huge:
@@ -382,46 +365,52 @@ static int json_str_is(const char *buf, const char *key, const char *val) {
 
 /* Build Config from <model_dir>/config.json. Model-family behavior is derived,
  * not hardcoded: rope layout from model_type, router flavor from topk_method,
- * YaRN params from rope_scaling (absent => plain rope). */
+ * YaRN params from rope_scaling (absent/null => plain rope). */
 static Config config_from_json(const char *model_dir) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/config.json", model_dir);
-    char *b = read_text_file(path);
+    char *text = read_text_file(path);
+    cJSON *r = cJSON_Parse(text);
+    if (!r) { fprintf(stderr, "config_from_json: parse error in %s\n", path); exit(1); }
 
     Config c = {0};
-    c.n_layers          = (int)json_int(b, "num_hidden_layers", 0);
-    c.hidden_size       = (int)json_int(b, "hidden_size", 0);
-    c.n_heads           = (int)json_int(b, "num_attention_heads", 0);
+    c.n_layers          = cfg_int(r, "num_hidden_layers", 0);
+    c.hidden_size       = cfg_int(r, "hidden_size", 0);
+    c.n_heads           = cfg_int(r, "num_attention_heads", 0);
     c.n_kv_heads        = c.n_heads;                       /* MLA: no GQA */
-    c.q_lora_rank       = (int)json_int(b, "q_lora_rank", 0);   /* null => 0 (no q-LoRA) */
-    c.first_k_dense     = (int)json_int(b, "first_k_dense_replace", 0);
-    c.kv_lora_rank      = (int)json_int(b, "kv_lora_rank", 0);
-    c.qk_rope_head_dim  = (int)json_int(b, "qk_rope_head_dim", 0);
-    c.qk_nope_head_dim  = (int)json_int(b, "qk_nope_head_dim", 0);
-    c.v_head_dim        = (int)json_int(b, "v_head_dim", 0);
-    c.n_routed_experts  = (int)json_int(b, "n_routed_experts", 0);
-    c.n_shared_experts  = (int)json_int(b, "n_shared_experts", 0);
-    c.n_experts_per_tok = (int)json_int(b, "num_experts_per_tok", 0);
-    c.dense_inter_size  = (int)json_int(b, "intermediate_size", 0);
-    c.moe_inter_size    = (int)json_int(b, "moe_intermediate_size", 0);
-    c.vocab_size        = (int)json_int(b, "vocab_size", 0);
-    long maxpos         = json_int(b, "max_position_embeddings", KV_CACHE_CAP);
-    c.max_seq_len       = maxpos < KV_CACHE_CAP ? (int)maxpos : KV_CACHE_CAP;
-    c.rms_eps           = (float)json_double(b, "rms_norm_eps", 1e-5);
+    c.q_lora_rank       = cfg_int(r, "q_lora_rank", 0);    /* null => 0 (no q-LoRA) */
+    c.first_k_dense     = cfg_int(r, "first_k_dense_replace", 0);
+    c.kv_lora_rank      = cfg_int(r, "kv_lora_rank", 0);
+    c.qk_rope_head_dim  = cfg_int(r, "qk_rope_head_dim", 0);
+    c.qk_nope_head_dim  = cfg_int(r, "qk_nope_head_dim", 0);
+    c.v_head_dim        = cfg_int(r, "v_head_dim", 0);
+    c.n_routed_experts  = cfg_int(r, "n_routed_experts", 0);
+    c.n_shared_experts  = cfg_int(r, "n_shared_experts", 0);
+    c.n_experts_per_tok = cfg_int(r, "num_experts_per_tok", 0);
+    c.dense_inter_size  = cfg_int(r, "intermediate_size", 0);
+    c.moe_inter_size    = cfg_int(r, "moe_intermediate_size", 0);
+    c.vocab_size        = cfg_int(r, "vocab_size", 0);
+    int maxpos          = cfg_int(r, "max_position_embeddings", KV_CACHE_CAP);
+    c.max_seq_len       = maxpos < KV_CACHE_CAP ? maxpos : KV_CACHE_CAP;
+    c.rms_eps           = (float)cfg_double(r, "rms_norm_eps", 1e-5);
     c.mla_norm_eps      = 1e-6f;   /* q_a/kv_a RMSNorm class default — not in config.json */
     c.softmax_scale     = 1.0f / sqrtf((float)(c.qk_nope_head_dim + c.qk_rope_head_dim));
-    c.rope_theta        = (float)json_double(b, "rope_theta", 10000.0);
-    /* rope_scaling (YaRN): present => factor from it; absent/null => plain (factor 1).
-     * "factor"/"beta_*"/"original_max_position_embeddings" only occur inside it. */
-    c.rope_factor       = (float)json_double(b, "factor", 1.0);
-    c.rope_beta_fast    = (float)json_double(b, "beta_fast", 32.0);
-    c.rope_beta_slow    = (float)json_double(b, "beta_slow", 1.0);
-    c.rope_orig_max     = (float)json_double(b, "original_max_position_embeddings", 4096.0);
-    c.rope_interleaved  = json_str_is(b, "model_type", "glm4_moe_lite");  /* else complex */
-    c.router_sigmoid    = json_str_is(b, "topk_method", "noaux_tc");      /* else softmax-greedy */
-    c.norm_topk         = json_bool(b, "norm_topk_prob", 0);
-    c.routed_scaling    = (float)json_double(b, "routed_scaling_factor", 1.0);
-    free(b);
+    c.rope_theta        = (float)cfg_double(r, "rope_theta", 10000.0);
+    /* rope_scaling (YaRN) is an object when present, JSON null otherwise =>
+     * plain rope (factor 1). */
+    const cJSON *rs = cJSON_GetObjectItemCaseSensitive(r, "rope_scaling");
+    if (!cJSON_IsObject(rs)) rs = NULL;
+    c.rope_factor    = rs ? (float)cfg_double(rs, "factor", 1.0) : 1.0f;
+    c.rope_beta_fast = rs ? (float)cfg_double(rs, "beta_fast", 32.0) : 32.0f;
+    c.rope_beta_slow = rs ? (float)cfg_double(rs, "beta_slow", 1.0) : 1.0f;
+    c.rope_orig_max  = rs ? (float)cfg_double(rs, "original_max_position_embeddings", 4096.0) : 4096.0f;
+    c.rope_interleaved  = cfg_str_is(r, "model_type", "glm4_moe_lite");  /* else complex */
+    c.router_sigmoid    = cfg_str_is(r, "topk_method", "noaux_tc");      /* else softmax-greedy */
+    c.norm_topk         = cfg_bool(r, "norm_topk_prob", 0);
+    c.routed_scaling    = (float)cfg_double(r, "routed_scaling_factor", 1.0);
+
+    cJSON_Delete(r);
+    free(text);
 
     if (c.n_layers <= 0 || c.hidden_size <= 0 || c.kv_lora_rank <= 0) {
         fprintf(stderr, "config_from_json: missing/invalid fields in %s\n", path);
