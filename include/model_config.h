@@ -1,14 +1,14 @@
-/* Per-model dims, hardcoded for Phase 0 (config.json-driven later). Values are
+/* Per-model dims, hardcoded (config.json-driven later). Values are
  * from each upstream config.json, verified against the on-disk weights.
  *
- * Layout caveats vs the plan's idealized MLA+MoE (relevant to Phase 1):
+ * Layout caveats vs the idealized MLA+MoE:
  *   - DeepSeek-V2-Lite: q_lora_rank=null -> single q_proj, no q_a/q_b/q_a_layernorm.
  *     GLM-4.7-Flash uses a query LoRA (768) so it does have them.
  *   - first_k_dense_replace=1 (both): layer 0 is a dense FFN, not MoE.
  */
 #pragma once
 
-/* DeepSeek-V2-Lite (15.7B / 2.4B active) — Phase 0 primary target */
+/* DeepSeek-V2-Lite (15.7B / 2.4B active) — primary target */
 #define DSV2LITE_N_LAYERS            27
 #define DSV2LITE_HIDDEN              2048
 #define DSV2LITE_N_HEADS             16
@@ -25,7 +25,7 @@
 #define DSV2LITE_DENSE_INTER_SIZE    10944
 #define DSV2LITE_FIRST_K_DENSE       1
 #define DSV2LITE_VOCAB_SIZE          102400
-#define DSV2LITE_MAX_SEQ_LEN         4096   /* pre-YaRN; Phase-0 cap */
+#define DSV2LITE_MAX_SEQ_LEN         4096   /* pre-YaRN cap */
 #define DSV2LITE_RMS_EPS             1e-6f
 /* YaRN RoPE (rope_scaling in config.json). mscale==mscale_all_dim => _mscale=1. */
 #define DSV2LITE_ROPE_THETA          10000.0f
@@ -51,4 +51,4 @@
 #define GLM47_DENSE_INTER_SIZE       10240
 #define GLM47_FIRST_K_DENSE          1
 #define GLM47_VOCAB_SIZE             154880
-#define GLM47_MAX_SEQ_LEN            4096   /* actual 202752; Phase-0 cap */
+#define GLM47_MAX_SEQ_LEN            4096   /* actual 202752; capped */

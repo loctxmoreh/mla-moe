@@ -11,7 +11,7 @@
 #include "safetensors_loader.h"
 #include "model_config.h"
 
-/* Mirrors llama2.c's Config; hardcoded from model_config.h in Phase 0. */
+/* Mirrors llama2.c's Config; hardcoded from model_config.h. */
 typedef struct {
     int   n_layers;
     int   hidden_size;
@@ -151,7 +151,7 @@ static bf16_t *must_get(TensorStore *s, const char *name) {
 }
 
 /* Resolve tensor names into weight pointers; allocates per-layer arrays,
- * never copies tensor data. The real work of Phase 0. */
+ * never copies tensor data. */
 static void build_model_weights(Transformer *t) {
     Config       *c = &t->config;
     ModelWeights *w = &t->weights;
@@ -329,7 +329,7 @@ static void free_model_weights(ModelWeights *w, int n_layers) {
     free(w->expert_gate); free(w->expert_up); free(w->expert_down);
 }
 
-/* Hardcoded per-model config for Phase 0 (config.json-driven later). */
+/* Hardcoded per-model config (config.json-driven later). */
 static Config config_for(const char *model) {
     if (strcmp(model, "dsv2lite") == 0) {
         return (Config){
@@ -436,7 +436,7 @@ static float *build_rope_inv_freq(const Config *c) {
 
 void build_transformer(Transformer *t, const char *model,
                        const char *index_path, const char *shard_dir) {
-    /* 1. load config (hardcoded per model for Phase 0) */
+    /* 1. load config (hardcoded per model) */
     t->config = config_for(model);
     /* 2. mmap all shards */
     t->store = st_load_sharded(index_path, shard_dir);
@@ -456,7 +456,7 @@ void free_transformer(Transformer *t) {
 }
 
 /* ---------------------------------------------------------------------------
- * Phase 1: unabsorbed (prefill) forward pass for dsv2lite.
+ * Unabsorbed (prefill) forward pass.
  * bf16 weights, fp32 compute; one stream, whole prompt in one call.
  * ------------------------------------------------------------------------- */
 
@@ -991,7 +991,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr,
             "Usage: %s <model> <index_json> <shard_dir> [tokens.i32.bin] [dump_dir]\n"
             "  model: dsv2lite | glm47\n"
-            "  no tokens file  -> Phase 0 weight-load smoke test\n"
+            "  no tokens file  -> weight-load smoke test\n"
             "  tokens file     -> prefill + greedy absorbed decode (prints token ids)\n"
             "  + dump_dir      -> prefill + ONE decode step, writing oracle-named\n"
             "                     prefill_*/decode_* intermediates for validation\n", argv[0]);
@@ -1015,7 +1015,7 @@ int main(int argc, char *argv[]) {
            t.config.n_layers, t.config.hidden_size, t.config.vocab_size);
 
     if (!tokens_path) {
-        printf("Phase 0 — weights loaded; pass a tokens file to run prefill.\n");
+        printf("weights loaded; pass a tokens file to run prefill.\n");
         free_transformer(&t);
         return 0;
     }
