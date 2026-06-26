@@ -29,10 +29,18 @@ typedef struct {
     int   moe_inter_size;     /* per-expert FFN width on MoE layers */
     int   vocab_size;
     int   max_seq_len;
-    float rms_eps;
-    float softmax_scale;      /* q_head_dim**-0.5 (no mscale for dsv2lite) */
-    /* YaRN RoPE params (for inv_freq construction at build time) */
+    float rms_eps;            /* decoder norms: input/post_attn/final */
+    float mla_norm_eps;       /* q_a_layernorm & kv_a_layernorm (GLM uses 1e-6 here,
+                               * not the config 1e-5 — q_a's tiny variance is eps-sensitive) */
+    float softmax_scale;      /* q_head_dim**-0.5 (no mscale for either model) */
+    /* YaRN RoPE params (for inv_freq construction at build time; factor==1 =>
+     * plain RoPE, which is how GLM uses it). */
     float rope_theta, rope_factor, rope_beta_fast, rope_beta_slow, rope_orig_max;
+    int   rope_interleaved;   /* 0: dsv2 complex adjacent-pair; 1: GLM split-half */
+    /* MoE router flavor */
+    int   router_sigmoid;     /* 0: softmax (dsv2); 1: sigmoid + e_score bias (GLM) */
+    int   norm_topk;          /* normalize the top-k weights before scaling */
+    float routed_scaling;     /* multiply routed weights (1.0 dsv2, 1.8 GLM) */
 } Config;
 
 /* bf16_t* point into TensorStore mmaps (zero copy); per-layer arrays are
@@ -76,7 +84,8 @@ typedef struct {
 
     /* Per-layer MoE routing — non-NULL only for MoE layers */
     bf16_t **moe_gate;       /* [n_layers]: [n_routed_experts, hidden_size] */
-    bf16_t **moe_gate_bias;  /* [n_layers]: mlp.gate.e_score_correction_bias — GLM only, else NULL */
+    float  **moe_gate_bias;  /* [n_layers]: mlp.gate.e_score_correction_bias — GLM only,
+                              * stored F32 in the checkpoint (points into mmap); else NULL */
 
     /* Per-layer routed expert FFN weights: [n_layers][n_experts] (NULL on dense layers) */
     bf16_t ***expert_gate;   /* gate_proj: [inter_size, hidden_size] */
@@ -102,6 +111,7 @@ typedef struct {
 
     /* MLA attention intermediates */
     float *q;           /* query:  [n_heads * (qk_nope_head_dim + qk_rope_head_dim)] */
+    float *q_a;         /* q-LoRA latent (GLM only): [q_lora_rank]; NULL for dsv2 */
     float *c_kv;        /* compressed KV latent: [kv_lora_rank + qk_rope_head_dim] */
     float *att;         /* attention scores:     [n_heads * max_seq_len] */
 
@@ -167,7 +177,7 @@ static void build_model_weights(Transformer *t) {
     w->dense_up        = malloc(c->n_layers * sizeof(bf16_t*));
     w->dense_down      = malloc(c->n_layers * sizeof(bf16_t*));
     w->moe_gate        = malloc(c->n_layers * sizeof(bf16_t*));
-    w->moe_gate_bias   = malloc(c->n_layers * sizeof(bf16_t*));
+    w->moe_gate_bias   = malloc(c->n_layers * sizeof(float*));
     w->shared_gate     = malloc(c->n_layers * sizeof(bf16_t*));
     w->shared_up       = malloc(c->n_layers * sizeof(bf16_t*));
     w->shared_down     = malloc(c->n_layers * sizeof(bf16_t*));
@@ -225,7 +235,7 @@ static void build_model_weights(Transformer *t) {
             snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", l);
             w->dense_down[l] = must_get(s, name);
 
-            w->moe_gate[l] = w->moe_gate_bias[l] = NULL;
+            w->moe_gate[l] = NULL; w->moe_gate_bias[l] = NULL;
             w->shared_gate[l] = w->shared_up[l] = w->shared_down[l] = NULL;
             w->expert_gate[l] = w->expert_up[l] = w->expert_down[l] = NULL;
             continue;
@@ -238,8 +248,8 @@ static void build_model_weights(Transformer *t) {
 
         /* optional router bias (GLM has it, DSV2 does not) */
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.e_score_correction_bias", l);
-        const Tensor *bias = st_get(s, name);
-        w->moe_gate_bias[l] = bias ? bias->data : NULL;
+        const Tensor *bias = st_get(s, name);   /* F32 in checkpoint, zero-copy */
+        w->moe_gate_bias[l] = bias ? (float *)bias->data : NULL;
 
         /* shared expert */
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_experts.gate_proj.weight", l);
@@ -281,6 +291,7 @@ static void malloc_run_state(RunState *s, const Config *c) {
     s->xb         = calloc(h, sizeof(float));
     s->xb2        = calloc(h, sizeof(float));
     s->q          = calloc(q_dim, sizeof(float));
+    s->q_a        = c->q_lora_rank > 0 ? calloc(c->q_lora_rank, sizeof(float)) : NULL;
     s->c_kv       = calloc(kv_dim, sizeof(float));
     s->att        = calloc((size_t)c->n_heads * c->max_seq_len, sizeof(float));
     s->kv_cache   = calloc((size_t)c->n_layers * c->max_seq_len * kv_dim, sizeof(float));
@@ -293,7 +304,7 @@ static void malloc_run_state(RunState *s, const Config *c) {
 
 static void free_run_state(RunState *s) {
     free(s->x);   free(s->xb);  free(s->xb2);
-    free(s->q);   free(s->c_kv); free(s->att);
+    free(s->q);   free(s->q_a); free(s->c_kv); free(s->att);
     free(s->kv_cache);
     free(s->moe_logits); free(s->expert_out);
     free(s->hb);  free(s->hb2); free(s->logits);
@@ -339,6 +350,7 @@ static Config config_for(const char *model) {
             .vocab_size         = DSV2LITE_VOCAB_SIZE,
             .max_seq_len        = DSV2LITE_MAX_SEQ_LEN,
             .rms_eps            = DSV2LITE_RMS_EPS,
+            .mla_norm_eps       = DSV2LITE_RMS_EPS,   /* dsv2: all norms 1e-6 */
             /* softmax_scale = q_head_dim**-0.5 = (qk_nope+qk_rope)**-0.5 */
             .softmax_scale      = 1.0f / sqrtf(DSV2LITE_QK_NOPE_HEAD_DIM + DSV2LITE_QK_ROPE_HEAD_DIM),
             .rope_theta         = DSV2LITE_ROPE_THETA,
@@ -346,6 +358,10 @@ static Config config_for(const char *model) {
             .rope_beta_fast     = DSV2LITE_ROPE_BETA_FAST,
             .rope_beta_slow     = DSV2LITE_ROPE_BETA_SLOW,
             .rope_orig_max      = DSV2LITE_ROPE_ORIG_MAX,
+            .rope_interleaved   = 0,
+            .router_sigmoid     = 0,     /* softmax-greedy */
+            .norm_topk          = 0,
+            .routed_scaling     = 1.0f,
         };
     }
     if (strcmp(model, "glm47") == 0) {
@@ -367,11 +383,17 @@ static Config config_for(const char *model) {
             .moe_inter_size     = GLM47_MOE_INTER_SIZE,
             .vocab_size         = GLM47_VOCAB_SIZE,
             .max_seq_len        = GLM47_MAX_SEQ_LEN,
-            .rms_eps            = 1e-5f,   /* GLM; Phase 3 */
+            .rms_eps            = 1e-5f,    /* decoder norms (config rms_norm_eps) */
+            .mla_norm_eps       = 1e-6f,    /* q_a/kv_a layernorms (verified vs oracle) */
             .softmax_scale      = 1.0f / sqrtf(GLM47_QK_NOPE_HEAD_DIM + GLM47_QK_ROPE_HEAD_DIM),
-            /* GLM RoPE params filled in Phase 3 (interleaved, different YaRN) */
-            .rope_theta = 10000.0f, .rope_factor = 1.0f,
+            /* GLM: plain RoPE (rope_scaling=null) => factor=1 degenerates the YaRN
+             * builder to inv_freq = 1/theta^(2j/dim); theta=1e6; interleaved layout. */
+            .rope_theta = 1000000.0f, .rope_factor = 1.0f,
             .rope_beta_fast = 32.0f, .rope_beta_slow = 1.0f, .rope_orig_max = 4096.0f,
+            .rope_interleaved   = 1,
+            .router_sigmoid     = 1,     /* noaux_tc: sigmoid + e_score_correction_bias */
+            .norm_topk          = 1,
+            .routed_scaling     = 1.8f,
         };
     }
     fprintf(stderr, "unknown model '%s' (expected: dsv2lite | glm47)\n", model);
@@ -484,14 +506,47 @@ static void matmul(float *y, const float *x, const bf16_t *w, int d_out, int n_i
 
 static inline float silu(float x) { return x / (1.0f + expf(-x)); }
 
-/* In-place DeepSeek complex (adjacent-pair) RoPE on a rope_dim slice at `pos`. */
-static void rope_apply(float *v, int pos, const float *inv_freq, int rope_dim) {
-    for (int j = 0; j < rope_dim / 2; j++) {
+/* In-place RoPE on a rope_dim slice at `pos`. Two layouts, selected per model:
+ *   interleaved==0 (dsv2): complex adjacent-pair — rotate (v[2j], v[2j+1]) in place.
+ *   interleaved==1 (GLM):  even/odd pairs, output split-half
+ *     [v0'..v31' | v32'..v63'] where v_j'=even_j*c-odd_j*s, v_{half+j}'=odd_j*c+even_j*s.
+ * Both rotate by angle pos*inv_freq[j]; q and k share the layout, so it is
+ * self-consistent in the score either way. */
+static void rope_apply(float *v, int pos, const float *inv_freq, int rope_dim,
+                       int interleaved) {
+    int half = rope_dim / 2;
+    if (!interleaved) {
+        for (int j = 0; j < half; j++) {
+            float ang = (float)pos * inv_freq[j];
+            float c = cosf(ang), s = sinf(ang);
+            float x0 = v[2 * j], x1 = v[2 * j + 1];
+            v[2 * j]     = x0 * c - x1 * s;
+            v[2 * j + 1] = x0 * s + x1 * c;
+        }
+        return;
+    }
+    float out[256];   /* qk_rope_head_dim <= 256 */
+    for (int j = 0; j < half; j++) {
         float ang = (float)pos * inv_freq[j];
         float c = cosf(ang), s = sinf(ang);
-        float x0 = v[2 * j], x1 = v[2 * j + 1];
-        v[2 * j]     = x0 * c - x1 * s;
-        v[2 * j + 1] = x0 * s + x1 * c;
+        float even = v[2 * j], odd = v[2 * j + 1];
+        out[j]        = even * c - odd * s;
+        out[half + j] = odd  * c + even * s;
+    }
+    memcpy(v, out, rope_dim * sizeof(float));
+}
+
+/* Query projection for one token. dsv2: a single q_proj. GLM: a query LoRA
+ * q = q_b_proj(rmsnorm(q_a_proj(x))). Writes q[n_heads*q_head_dim]. */
+static void project_q(const Config *c, ModelWeights *w, RunState *s, int l,
+                      const float *xn, float *q) {
+    int q_dim = c->n_heads * (c->qk_nope_head_dim + c->qk_rope_head_dim);
+    if (c->q_lora_rank > 0) {
+        matmul(s->q_a, xn, w->q_a_proj[l], c->q_lora_rank, c->hidden_size);
+        rmsnorm(s->q_a, s->q_a, w->q_a_layernorm[l], c->q_lora_rank, c->mla_norm_eps);
+        matmul(q, s->q_a, w->q_b_proj[l], q_dim, c->q_lora_rank);
+    } else {
+        matmul(q, xn, w->q_proj[l], q_dim, c->hidden_size);
     }
 }
 
@@ -518,10 +573,14 @@ static void softmax(float *x, int n) {
 }
 
 /* One token's FFN, shared by prefill and decode. xn is the post_attn_norm'd
- * hidden; writes out[hidden]. Dense SwiGLU for l < first_k_dense, else
- * softmax-greedy top-k routed experts + shared expert. When topk_idx/topk_w are
- * non-NULL (MoE layers) the chosen experts are returned; s->moe_logits is left
- * holding the full router softmax (for dumping). */
+ * hidden; writes out[hidden]. Dense SwiGLU for l < first_k_dense, else top-k
+ * routed experts + shared expert. Router flavor is config-driven:
+ *   dsv2: softmax scores, greedy top-k, weight = score, no norm, scale 1.
+ *   GLM (noaux_tc): sigmoid scores, select by (score + e_score bias), weight =
+ *     raw sigmoid score, normalize the top-k, then * routed_scaling.
+ * (n_group/topk_group are 1 for GLM-4.7-Flash, so group-limited routing reduces
+ * to a plain top-k — not implemented.) When topk_idx/topk_w are non-NULL the
+ * chosen experts are returned; s->moe_logits is left holding the full scores. */
 static void ffn_compute(const Config *c, ModelWeights *w, RunState *s, int l,
                         const float *xn, float *out, int *topk_idx, float *topk_w) {
     const int H = c->hidden_size;
@@ -531,7 +590,13 @@ static void ffn_compute(const Config *c, ModelWeights *w, RunState *s, int l,
         return;
     }
     matmul(s->moe_logits, xn, w->moe_gate[l], c->n_routed_experts, H);
-    softmax(s->moe_logits, c->n_routed_experts);
+    if (c->router_sigmoid)
+        for (int e = 0; e < c->n_routed_experts; e++)
+            s->moe_logits[e] = 1.0f / (1.0f + expf(-s->moe_logits[e]));
+    else
+        softmax(s->moe_logits, c->n_routed_experts);
+
+    const float *bias = w->moe_gate_bias[l];   /* GLM e_score_correction_bias (F32), else NULL */
     int  K = c->n_experts_per_tok;
     int  idx[16]; float wts[16];        /* K <= 16 */
     char used[1024] = {0};              /* n_routed <= 1024 */
@@ -539,10 +604,18 @@ static void ffn_compute(const Config *c, ModelWeights *w, RunState *s, int l,
         int best = -1; float bv = -INFINITY;
         for (int e = 0; e < c->n_routed_experts; e++) {
             if (used[e]) continue;
-            if (s->moe_logits[e] > bv) { bv = s->moe_logits[e]; best = e; }
+            float sel = s->moe_logits[e] + (bias ? bias[e] : 0.0f);
+            if (sel > bv) { bv = sel; best = e; }
         }
-        used[best] = 1; idx[r] = best; wts[r] = bv;   /* routed_scaling=1, no norm */
+        used[best] = 1; idx[r] = best; wts[r] = s->moe_logits[best];   /* raw score */
     }
+    if (c->norm_topk) {
+        float sum = 1e-20f;
+        for (int r = 0; r < K; r++) sum += wts[r];
+        for (int r = 0; r < K; r++) wts[r] /= sum;
+    }
+    for (int r = 0; r < K; r++) wts[r] *= c->routed_scaling;
+
     for (int i = 0; i < H; i++) out[i] = 0.0f;
     for (int r = 0; r < K; r++) {
         swiglu(s->expert_out, xn, w->expert_gate[l][idx[r]], w->expert_up[l][idx[r]],
@@ -605,15 +678,16 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
         /* ---- per-position projections: q (roped), c_kv, k_pe (roped, cached) ---- */
         for (int p = 0; p < n_prompt; p++) {
             rmsnorm(xb, &xs[p * H], w->input_layernorm[l], H, eps);
-            matmul(&qall[(size_t)p * NH * QHD], xb, w->q_proj[l], NH * QHD, H);
+            project_q(c, w, s, l, xb, &qall[(size_t)p * NH * QHD]);
             for (int h = 0; h < NH; h++)
-                rope_apply(&qall[((size_t)p * NH + h) * QHD + QKN], p, inv_freq, QKR);
+                rope_apply(&qall[((size_t)p * NH + h) * QHD + QKN], p, inv_freq, QKR,
+                           c->rope_interleaved);
 
             matmul(comp, xb, w->kv_a_proj[l], KVD, H);
             float *cache_p = &kv_l[(size_t)p * KVD];
-            rmsnorm(cache_p, comp, w->kv_a_layernorm[l], KVL, eps);  /* c_kv */
+            rmsnorm(cache_p, comp, w->kv_a_layernorm[l], KVL, c->mla_norm_eps);  /* c_kv */
             memcpy(cache_p + KVL, comp + KVL, QKR * sizeof(float));  /* k_pe (raw) */
-            rope_apply(cache_p + KVL, p, inv_freq, QKR);             /* k_pe (roped) */
+            rope_apply(cache_p + KVL, p, inv_freq, QKR, c->rope_interleaved); /* roped */
         }
 
         /* ---- decompress per-head K_nope and V for every key ---- */
@@ -793,16 +867,16 @@ float *forward_absorbed(Transformer *t, int token, int pos) {
         float *kv_l = &s->kv_cache[(size_t)l * cache_row];
 
         rmsnorm(xb, x, w->input_layernorm[l], H, eps);
-        matmul(q, xb, w->q_proj[l], NH * QHD, H);
+        project_q(c, w, s, l, xb, q);
         for (int h = 0; h < NH; h++)
-            rope_apply(&q[(size_t)h * QHD + QKN], pos, inv_freq, QKR);
+            rope_apply(&q[(size_t)h * QHD + QKN], pos, inv_freq, QKR, c->rope_interleaved);
 
         /* append this position's latent KV */
         matmul(comp, xb, w->kv_a_proj[l], KVD, H);
         float *cache_p = &kv_l[(size_t)pos * KVD];
-        rmsnorm(cache_p, comp, w->kv_a_layernorm[l], KVL, eps);
+        rmsnorm(cache_p, comp, w->kv_a_layernorm[l], KVL, c->mla_norm_eps);
         memcpy(cache_p + KVL, comp + KVL, QKR * sizeof(float));
-        rope_apply(cache_p + KVL, pos, inv_freq, QKR);
+        rope_apply(cache_p + KVL, pos, inv_freq, QKR, c->rope_interleaved);
 
         for (int h = 0; h < NH; h++) {
             const bf16_t *WUK = w->W_UK[l] + (size_t)h * kv_stride;
