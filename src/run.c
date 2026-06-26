@@ -1,6 +1,7 @@
 /* MLA-MOE inference entry point; structure follows llama2.c.
- * Phase 1 (dsv2lite): forward_unabsorbed() runs the whole-prompt prefill and is
- * oracle-validated; forward_absorbed() (decode) is Phase 2. */
+ * forward_unabsorbed() (whole-prompt prefill) and forward_absorbed() (one-token
+ * decode) are both oracle-validated for dsv2lite AND glm47 within tol=2e-3.
+ * Config still hardcoded per model (config.json-driven later). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
