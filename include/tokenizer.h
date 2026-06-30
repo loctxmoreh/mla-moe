@@ -1,9 +1,10 @@
 #ifndef TOKENIZER_H
 #define TOKENIZER_H
 
-/* Byte-level BPE tokenizer (GPT-2 family) for DeepSeek-V2-Lite.
+/* Byte-level BPE tokenizer (GPT-2 family) for DeepSeek-V2-Lite and
+ * GLM-4.7-Flash (pre-tokenizer selected by config.json model_type).
  * Faithful to HuggingFace for ASCII/English text; the pre-tokenizer's
- * non-ASCII letter/punctuation/CJK ranges are intentionally not implemented
+ * non-ASCII letter/punctuation/CJK handling is intentionally not implemented
  * (such input still yields valid tokens, but may split differently). */
 
 typedef struct Tokenizer Tokenizer;

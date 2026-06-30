@@ -61,6 +61,8 @@ static void map_free(Map *m) {
 
 /* ---- tokenizer state ----------------------------------------------------- */
 
+typedef enum { PRETOK_DEEPSEEK, PRETOK_GLM } PretokStyle;
+
 struct Tokenizer {
     Map vocab;          /* byte-level token string -> id          */
     Map ranks;          /* "left right" merge string -> rank      */
@@ -68,6 +70,8 @@ struct Tokenizer {
     char *is_special;   /* id -> 1 if added/special token         */
     int n_ids;          /* length of id2tok / is_special          */
     int bos_id, eos_id;
+    int ignore_merges;  /* GLM: a whole-word vocab hit skips BPE   */
+    PretokStyle pretok; /* which pre-tokenizer front-end to run    */
     int byte2cp[256];   /* GPT-2 byte -> byte-level codepoint      */
     int cp2byte[512];   /* inverse (codepoint <= 323)              */
     char *bytetok[256]; /* byte -> its byte-level UTF-8 string     */
@@ -175,13 +179,28 @@ Tokenizer *tokenizer_load(const char *model_dir) {
         }
     }
 
-    /* merges: "left right" -> rank (array index) */
+    /* merges -> rank (array index). Two on-disk shapes: a space-joined string
+     * "left right" (DeepSeek) or a ["left","right"] pair (GLM). Key both as
+     * "left right". */
     map_init(&t->ranks, (size_t)cJSON_GetArraySize(merges));
     int rank = 0;
     for (const cJSON *it = merges->child; it; it = it->next, rank++) {
-        const char *s = cJSON_IsString(it) ? it->valuestring : NULL;
-        if (s) map_put(&t->ranks, s, strlen(s), rank);
+        if (cJSON_IsString(it)) {
+            map_put(&t->ranks, it->valuestring, strlen(it->valuestring), rank);
+        } else if (cJSON_IsArray(it) && cJSON_GetArraySize(it) == 2) {
+            const char *l = cJSON_GetArrayItem(it, 0)->valuestring;
+            const char *r = cJSON_GetArrayItem(it, 1)->valuestring;
+            if (!l || !r) continue;
+            size_t ll = strlen(l), rl = strlen(r);
+            char key[256];
+            if (ll + 1 + rl >= sizeof(key)) continue;
+            memcpy(key, l, ll); key[ll] = ' '; memcpy(key + ll + 1, r, rl);
+            map_put(&t->ranks, key, ll + 1 + rl, rank);
+        }
     }
+
+    const cJSON *im = cJSON_GetObjectItemCaseSensitive(model, "ignore_merges");
+    t->ignore_merges = cJSON_IsTrue(im);
 
     /* added/special tokens: id -> content, mark special */
     for (const cJSON *it = added ? added->child : NULL; it; it = it->next) {
@@ -195,14 +214,20 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     }
     cJSON_Delete(root);
 
-    /* bos/eos from config.json (authoritative) */
+    /* bos/eos and model family from config.json (authoritative) */
     snprintf(path, sizeof(path), "%s/config.json", model_dir);
     char *cfgtext = read_file(path);
     if (cfgtext) {
         cJSON *cfg = cJSON_Parse(cfgtext);
         if (cfg) {
             t->bos_id = json_int(cfg, "bos_token_id", -1);
-            t->eos_id = json_int(cfg, "eos_token_id", -1);
+            /* eos_token_id may be a number or a list (GLM); take the first id */
+            const cJSON *e = cJSON_GetObjectItemCaseSensitive(cfg, "eos_token_id");
+            if (cJSON_IsArray(e)) e = e->child;
+            t->eos_id = cJSON_IsNumber(e) ? (int)e->valuedouble : -1;
+            const cJSON *mt = cJSON_GetObjectItemCaseSensitive(cfg, "model_type");
+            if (cJSON_IsString(mt) && strstr(mt->valuestring, "glm"))
+                t->pretok = PRETOK_GLM;
             cJSON_Delete(cfg);
         }
         free(cfgtext);
@@ -288,6 +313,67 @@ static void split_digits(const PieceList *in, PieceList *out) {
     }
 }
 
+static unsigned char lc(unsigned char c) { return (c>='A'&&c<='Z') ? c+32 : c; }
+/* [^\r\n\p{L}\p{N}] and [^\s\p{L}\p{N}], reduced to ASCII letter/digit. */
+static int is_other_nl(unsigned char c) { return c!='\r'&&c!='\n'&&!is_alpha(c)&&!is_digit(c); }
+static int is_other_sp(unsigned char c) { return !is_space(c)&&!is_alpha(c)&&!is_digit(c); }
+
+/* GLM pre-tokenizer: the GPT-4-style Split regex (Isolated), \p{L}->ASCII
+ * letters and \p{N}->ASCII digits. The alternation covers every character, so
+ * the matches partition the string with no gaps; emit each as a piece.
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d)        contractions
+ *   | [^\r\n\p{L}\p{N}]?\p{L}+          optional lead char + letters
+ *   | \p{N}{1,3}                        1-3 digits
+ *   |  ?[^\s\p{L}\p{N}]+[\r\n]*         optional space + symbols + newlines
+ *   | \s*[\r\n]+ | \s+(?!\S) | \s+      whitespace / newline runs            */
+static void pretokenize_glm(const char *s, int len, PieceList *out) {
+    int i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)s[i];
+        int end = -1;
+
+        if (c == '\'') {                                 /* alt 1: contractions */
+            unsigned char d1 = i+1<len ? lc((unsigned char)s[i+1]) : 0;
+            unsigned char d2 = i+2<len ? lc((unsigned char)s[i+2]) : 0;
+            if (d1=='s'||d1=='t'||d1=='m'||d1=='d') end = i+2;
+            else if ((d1=='r'&&d2=='e')||(d1=='v'&&d2=='e')||(d1=='l'&&d2=='l')) end = i+3;
+        }
+        if (end < 0) {                                   /* alt 2: ?letter + letters */
+            int p = i;
+            if (is_other_nl(c) && i+1<len && is_alpha((unsigned char)s[i+1])) p = i+1;
+            if (is_alpha((unsigned char)s[p])) {
+                int q = p; while (q<len && is_alpha((unsigned char)s[q])) q++;
+                end = q;
+            }
+        }
+        if (end < 0 && is_digit(c)) {                    /* alt 3: 1-3 digits */
+            int q = i; while (q<len && is_digit((unsigned char)s[q]) && q-i<3) q++;
+            end = q;
+        }
+        if (end < 0) {                                   /* alt 4: ?space + symbols + nl */
+            int p = i;
+            if (c==' ' && i+1<len && is_other_sp((unsigned char)s[i+1])) p = i+1;
+            if (is_other_sp((unsigned char)s[p])) {
+                int q = p; while (q<len && is_other_sp((unsigned char)s[q])) q++;
+                while (q<len && (s[q]=='\r'||s[q]=='\n')) q++;
+                end = q;
+            }
+        }
+        if (end < 0 && is_space(c)) {                    /* alts 5-7: whitespace */
+            int q = i; while (q<len && is_space((unsigned char)s[q])) q++;
+            int last_nl = -1;
+            for (int k = i; k < q; k++) if (s[k]=='\r'||s[k]=='\n') last_nl = k;
+            if (last_nl >= 0) end = last_nl + 1;          /* \s*[\r\n]+ */
+            else if (q == len) end = q;                   /* \s+(?!\S) at EOF */
+            else if (q-1 > i) end = q-1;                  /* \s+(?!\S): keep last */
+            else end = q;                                 /* \s+ */
+        }
+        if (end <= i) end = i+1;                          /* safety: always advance */
+        pl_push(out, s + i, end - i);
+        i = end;
+    }
+}
+
 /* ---- BPE merge ----------------------------------------------------------- */
 
 typedef struct { int off, len; } Sym;   /* span into the byte-level buffer */
@@ -296,6 +382,12 @@ typedef struct { int off, len; } Sym;   /* span into the byte-level buffer */
 static int bpe_piece(const Tokenizer *t, const char *enc, Sym *sym, int n,
                      int *out, int max, int nout) {
     char key[256];
+    /* ignore_merges (GLM): if the whole byte-level word is a token, use it. */
+    if (t->ignore_merges && n > 0) {
+        int total = sym[n-1].off + sym[n-1].len;          /* spans start at 0 */
+        int id = map_get(&t->vocab, enc, total, -1);
+        if (id >= 0) { if (nout < max) out[nout++] = id; return nout; }
+    }
     for (;;) {
         int best = -1, best_rank = 0;
         for (int i = 0; i + 1 < n; i++) {
@@ -326,15 +418,19 @@ int tokenizer_encode(const Tokenizer *t, const char *text, int add_bos,
     int n = 0;
     if (add_bos && t->bos_id >= 0 && n < max_ids) out_ids[n++] = t->bos_id;
 
-    /* pre-tokenize: chained Split stages over piece spans of `text` */
+    /* pre-tokenize into piece spans of `text` (result in b) */
     int tlen = (int)strlen(text);
     PieceList a = {0}, b = {0};
-    pl_push(&a, text, tlen);
-    split_newlines(&a, &b);                                   a.n = 0;
-    split_ws_class(&b, &a, is_alpha);                         b.n = 0;
-    split_ws_class(&a, &b, is_punct);                         a.n = 0;
-    split_trailing_ws(&b, &a);                                b.n = 0;
-    split_digits(&a, &b);                                     /* result in b */
+    if (t->pretok == PRETOK_GLM) {
+        pretokenize_glm(text, tlen, &b);
+    } else {
+        pl_push(&a, text, tlen);
+        split_newlines(&a, &b);                               a.n = 0;
+        split_ws_class(&b, &a, is_alpha);                     b.n = 0;
+        split_ws_class(&a, &b, is_punct);                     a.n = 0;
+        split_trailing_ws(&b, &a);                            b.n = 0;
+        split_digits(&a, &b);
+    }
 
     /* byte-level encode + BPE per piece */
     char *enc = NULL; Sym *sym = NULL; int enc_cap = 0, sym_cap = 0;

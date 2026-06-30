@@ -31,8 +31,8 @@ run <model_dir> [tokens.i32.bin | -p "text"] [dump_dir|ppl]
 shards; the model family is auto-detected from `config.json`. `tokens.i32.bin`
 is raw little-endian int32 token ids (the oracle's `input_ids.i32.bin` files are
 exactly this). Alternatively, `-p "text"` tokenizes a prompt with the in-C
-tokenizer (DeepSeek-V2-Lite; reads `tokenizer.json`), and generated ids are
-decoded back to text.
+tokenizer (reads `tokenizer.json`; pre-tokenizer chosen from `config.json`), and
+generated ids are decoded back to text.
 
 ```sh
 DSV=/path/to/deepseek-ai/DeepSeek-V2-Lite
@@ -70,8 +70,7 @@ with `uv run python tests/oracle/gen_oracle.py <dsv2lite|glm47>` (see
 
 ## Limitations
 
-Single stream (batch=1), greedy sampling. The in-C tokenizer covers
-DeepSeek-V2-Lite and is faithful for ASCII/English text only (non-ASCII still
-yields valid tokens but may split differently from HF); GLM-4.7-Flash
-tokenization is not yet implemented. Performance work (blocked matmuls,
-threading) is deferred — correctness first.
+Single stream (batch=1), greedy sampling. The in-C tokenizer covers both
+DeepSeek-V2-Lite and GLM-4.7-Flash, and is faithful for ASCII/English text only
+(non-ASCII still yields valid tokens but may split differently from HF).
+Performance work (blocked matmuls, threading) is deferred — correctness first.

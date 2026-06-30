@@ -23,6 +23,12 @@ PANEL = [
     "",
     "a",
     "    ",
+    # GLM GPT-4-regex stressers: contractions, digit grouping, glued punct
+    "I'll, you're, we've, don't, it's, he'd, I'm",
+    "1234567890 and 42000 and 007",
+    "(parens)[brackets]{braces}<angles>",
+    "a1b2c3 mix3d numb3rs",
+    "tab\tseparated\tvalues\nand newlines\n\n",
 ]
 
 def c_encode(model_dir, tok_cli, text):
