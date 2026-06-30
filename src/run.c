@@ -652,10 +652,24 @@ static void ffn_compute(const Config *c, ModelWeights *w, RunState *s, int l,
     if (topk_idx) for (int r = 0; r < K; r++) { topk_idx[r] = idx[r]; topk_w[r] = wts[r]; }
 }
 
+/* Teacher-forced negative log-likelihood of `target` under one logit row:
+ * -log softmax(logits)[target]. Double accumulation; never materializes probs. */
+static double nll_at(const float *logits, int vocab, int target) {
+    float m = logits[0];
+    for (int i = 1; i < vocab; i++) if (logits[i] > m) m = logits[i];
+    double se = 0.0;
+    for (int i = 0; i < vocab; i++) se += exp((double)(logits[i] - m));
+    return ((double)m + log(se)) - (double)logits[target];   /* logZ - logit[target] */
+}
+
 /* Whole-prompt prefill. Returns logits at the LAST position (RunState.logits).
+ * If nll_out != NULL, also accumulates the teacher-forced sum-NLL over positions
+ * [0, n_prompt-1): position p predicts tokens[p+1]. Writes the sum to *nll_out
+ * (count = n_prompt-1); one vocab row at a time, no [seq,vocab] buffer.
  * When built with -DMLA_ENABLE_DUMP and a dump dir is set, also writes the
  * oracle-named intermediates for validation. */
-float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
+float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt,
+                          double *nll_out) {
     const Config *c = &t->config;
     ModelWeights *w = &t->weights;
     RunState     *s = &t->state;
@@ -821,7 +835,18 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt) {
     }
 
     /* final norm + lm_head */
-    if (DUMPING()) {
+    if (nll_out) {
+        /* teacher-forced scoring: lm_head per position into s->logits (reused as
+         * scratch), accumulate NLL against the next token; last row stays in
+         * s->logits for the return, matching the non-scoring contract. */
+        double sum_nll = 0.0;
+        for (int p = 0; p < n_prompt; p++) {
+            rmsnorm(xb, &xs[(size_t)p * H], w->norm, H, eps);
+            matmul(s->logits, xb, w->lm_head, VOC, H);
+            if (p < n_prompt - 1) sum_nll += nll_at(s->logits, VOC, tokens[p + 1]);
+        }
+        *nll_out = sum_nll;
+    } else if (DUMPING()) {
         float *logits_all = malloc((size_t)n_prompt * VOC * sizeof(float));
         for (int p = 0; p < n_prompt; p++) {
             rmsnorm(xb, &xs[p * H], w->norm, H, eps);
@@ -995,7 +1020,7 @@ static int read_tokens_i32(const char *path, int *out, int max) {
 /* Two-path generation: one unabsorbed prefill over the prompt, then a greedy
  * absorbed-decode loop. Prints generated token ids (no detokenizer in C yet). */
 static void generate(Transformer *t, const int *prompt, int n_prompt, int max_new) {
-    float *logits = forward_unabsorbed(t, prompt, n_prompt);
+    float *logits = forward_unabsorbed(t, prompt, n_prompt, NULL);
     int tok = sample(logits, t->config.vocab_size);
     int pos = n_prompt;
     printf("generated:");
@@ -1017,12 +1042,16 @@ int main(int argc, char *argv[]) {
             "  no tokens file  -> weight-load smoke test\n"
             "  tokens file     -> prefill + greedy absorbed decode (prints token ids)\n"
             "  + dump_dir      -> prefill + ONE decode step, writing oracle-named\n"
-            "                     prefill_*/decode_* intermediates for validation\n", argv[0]);
+            "                     prefill_*/decode_* intermediates for validation\n"
+            "  + literal 'ppl' -> teacher-forced perplexity over the token sequence\n"
+            "                     (prints 'ppl <value>'); used by tests/oracle/compare_ppl.py\n", argv[0]);
         return 1;
     }
     const char *model_dir   = argv[1];
     const char *tokens_path = (argc > 2) ? argv[2] : NULL;
-    const char *dump_dir    = (argc > 3) ? argv[3] : NULL;
+    const char *third       = (argc > 3) ? argv[3] : NULL;
+    int   ppl_mode          = third && strcmp(third, "ppl") == 0;
+    const char *dump_dir    = (third && !ppl_mode) ? third : NULL;
 #ifndef MLA_ENABLE_DUMP
     if (dump_dir)
         fprintf(stderr, "note: dump_dir given but dumps not compiled in "
@@ -1047,11 +1076,22 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < n_prompt; i++) printf("%s%d", i ? ", " : "", tokens[i]);
     printf("]\n");
 
-    if (dump_dir) {
+    if (ppl_mode) {
+        /* teacher-forced perplexity over the token sequence (n_prompt-1 targets) */
+        if (n_prompt < 2) {
+            fprintf(stderr, "ppl needs >= 2 tokens (got %d)\n", n_prompt);
+            free_transformer(&t);
+            return 1;
+        }
+        double nll = 0.0;
+        forward_unabsorbed(&t, tokens, n_prompt, &nll);
+        int ntok = n_prompt - 1;
+        printf("ppl %.6f\nnll %.6f tokens %d\n", exp(nll / ntok), nll, ntok);
+    } else if (dump_dir) {
         /* validation scenario: prefill, then exactly one absorbed-decode step
          * (mirrors gen_oracle: feed the prefill argmax at position n_prompt). */
         run_set_dump(dump_dir);
-        float *logits = forward_unabsorbed(&t, tokens, n_prompt);
+        float *logits = forward_unabsorbed(&t, tokens, n_prompt, NULL);
         int next = sample(logits, t.config.vocab_size);
         printf("prefill argmax = %d  logit=%.6f\n", next, logits[next]);
         float *dlog = forward_absorbed(&t, next, n_prompt);
