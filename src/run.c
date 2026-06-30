@@ -359,9 +359,11 @@ static int cfg_str_is(const cJSON *o, const char *k, const char *val) {
     return cJSON_IsString(v) && v->valuestring && strcmp(v->valuestring, val) == 0;
 }
 
-/* Cap on the latent KV cache length (config max_position_embeddings is huge:
- * 163840 / 202752). Prompt + generated tokens must fit under this. */
-#define KV_CACHE_CAP 4096
+/* Cap on the latent KV cache length: the lower of the two target models'
+ * max_position_embeddings (dsv2lite 163840, glm47 202752). Prompt + generated
+ * tokens must fit under this. The cache is calloc'd at this length but pages are
+ * lazily backed, so unused positions cost no resident memory. */
+#define KV_CACHE_CAP 163840
 
 /* Build Config from <model_dir>/config.json. Model-family behavior is derived,
  * not hardcoded: rope layout from model_type, router flavor from topk_method,
