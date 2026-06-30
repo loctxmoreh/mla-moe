@@ -15,12 +15,16 @@ LIB_SRCS = src/safetensors_loader.c \
 # Two binaries:
 #   run      — llama2.c-style inference entry point (src/run.c)
 #   mla-moe  — weight inspection CLI (src/main.c)
-RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/run.c
+RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/run.c
 TOOL_SRCS = $(LIB_SRCS) src/main.c
 
-.PHONY: all clean
+.PHONY: all clean tok-cli
 
 all: run mla-moe
+
+# Standalone tokenizer harness (no model weights) for tests/tokenizer/compare_hf.py
+tok-cli: src/tokenizer.c vendor/cJSON.c tests/tokenizer/tok_cli.c
+	$(CC) $(CFLAGS) $^ -o tests/tokenizer/tok_cli $(LDFLAGS)
 
 run: $(RUN_SRCS)
 	$(CC) $(CFLAGS) $(RUN_SRCS) -o $@ $(LDFLAGS)

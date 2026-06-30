@@ -24,13 +24,15 @@ Debug builds (ASan + UBSan): `make debug-run` / `make debug-tool`.
 ## Run
 
 ```
-run <model_dir> [tokens.i32.bin] [dump_dir]
+run <model_dir> [tokens.i32.bin | -p "text"] [dump_dir|ppl]
 ```
 
 `<model_dir>` holds `config.json`, `model.safetensors.index.json`, and the
 shards; the model family is auto-detected from `config.json`. `tokens.i32.bin`
-is raw little-endian int32 token ids (there is no in-C tokenizer — feed
-pre-tokenized ids; the oracle's `input_ids.i32.bin` files are exactly this).
+is raw little-endian int32 token ids (the oracle's `input_ids.i32.bin` files are
+exactly this). Alternatively, `-p "text"` tokenizes a prompt with the in-C
+tokenizer (DeepSeek-V2-Lite; reads `tokenizer.json`), and generated ids are
+decoded back to text.
 
 ```sh
 DSV=/path/to/deepseek-ai/DeepSeek-V2-Lite
@@ -41,6 +43,9 @@ GLM=/path/to/zai-org/GLM-4.7-Flash
 
 # prefill + greedy absorbed-decode; prints generated token ids
 ./run "$DSV" tests/oracle/dumps/dsv2lite/input_ids.i32.bin
+
+# same, but from a text prompt (tokenized + detokenized in C)
+./run "$DSV" -p "The capital of France is"
 
 # (DUMP=1 build) prefill + one decode step, writing intermediates to <dump_dir>
 ./run "$GLM" tests/oracle/dumps/glm47/input_ids.i32.bin /tmp/cdump
@@ -65,5 +70,8 @@ with `uv run python tests/oracle/gen_oracle.py <dsv2lite|glm47>` (see
 
 ## Limitations
 
-Single stream (batch=1), greedy sampling, no tokenizer. Performance work
-(blocked matmuls, threading) is deferred — correctness first.
+Single stream (batch=1), greedy sampling. The in-C tokenizer covers
+DeepSeek-V2-Lite and is faithful for ASCII/English text only (non-ASCII still
+yields valid tokens but may split differently from HF); GLM-4.7-Flash
+tokenization is not yet implemented. Performance work (blocked matmuls,
+threading) is deferred — correctness first.

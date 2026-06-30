@@ -9,6 +9,7 @@
 
 #include "tensor.h"
 #include "safetensors_loader.h"
+#include "tokenizer.h"
 #include "cJSON.h"
 
 /* Mirrors llama2.c's Config; populated from config.json at load time. */
@@ -136,6 +137,7 @@ typedef struct {
     RunState     state;
     TensorStore *store;
     float       *rope_inv_freq;   /* [qk_rope_head_dim/2], YaRN-interpolated */
+    Tokenizer   *tokenizer;       /* NULL if model_dir has no tokenizer.json */
 } Transformer;
 
 /* Checked lookup: fail with the name instead of segfaulting on a NULL st_get.
@@ -468,9 +470,12 @@ void build_transformer(Transformer *t, const char *model_dir) {
     malloc_run_state(&t->state, &t->config);
     /* 5. precompute RoPE frequencies */
     t->rope_inv_freq = build_rope_inv_freq(&t->config);
+    /* 6. tokenizer (optional — absent for raw-token-id / oracle workflows) */
+    t->tokenizer = tokenizer_load(model_dir);
 }
 
 void free_transformer(Transformer *t) {
+    tokenizer_free(t->tokenizer);
     free(t->rope_inv_freq);
     free_run_state(&t->state);
     free_model_weights(&t->weights, t->config.n_layers);
@@ -1018,29 +1023,40 @@ static int read_tokens_i32(const char *path, int *out, int max) {
 }
 
 /* Two-path generation: one unabsorbed prefill over the prompt, then a greedy
- * absorbed-decode loop. Prints generated token ids (no detokenizer in C yet). */
+ * absorbed-decode loop. Prints generated token ids, and the decoded text when a
+ * tokenizer is loaded. Stops early on EOS. */
 static void generate(Transformer *t, const int *prompt, int n_prompt, int max_new) {
+    int eos = t->tokenizer ? tokenizer_eos_id(t->tokenizer) : -1;
     float *logits = forward_unabsorbed(t, prompt, n_prompt, NULL);
     int tok = sample(logits, t->config.vocab_size);
     int pos = n_prompt;
+    int *gen = malloc((size_t)max_new * sizeof(int)); int ng = 0;
     printf("generated:");
-    for (int i = 0; i < max_new; i++) {
+    for (int i = 0; i < max_new && tok != eos; i++) {
         printf(" %d", tok);
+        gen[ng++] = tok;
         logits = forward_absorbed(t, tok, pos);
         tok = sample(logits, t->config.vocab_size);
         pos++;
     }
-    printf(" %d\n", tok);
+    printf("\n");
+    if (t->tokenizer) {
+        char *s = tokenizer_decode(t->tokenizer, gen, ng);
+        printf("text:%s\n", s);
+        free(s);
+    }
+    free(gen);
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr,
-            "Usage: %s <model_dir> [tokens.i32.bin] [dump_dir]\n"
+            "Usage: %s <model_dir> [tokens.i32.bin | -p \"text\"] [dump_dir|ppl]\n"
             "  model_dir: holds config.json, model.safetensors.index.json, shards\n"
             "             (model family auto-detected from config.json)\n"
-            "  no tokens file  -> weight-load smoke test\n"
+            "  no input        -> weight-load smoke test\n"
             "  tokens file     -> prefill + greedy absorbed decode (prints token ids)\n"
+            "  -p \"text\"       -> tokenize text (needs tokenizer.json), then decode as above\n"
             "  + dump_dir      -> prefill + ONE decode step, writing oracle-named\n"
             "                     prefill_*/decode_* intermediates for validation\n"
             "  + literal 'ppl' -> teacher-forced perplexity over the token sequence\n"
@@ -1048,8 +1064,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     const char *model_dir   = argv[1];
-    const char *tokens_path = (argc > 2) ? argv[2] : NULL;
-    const char *third       = (argc > 3) ? argv[3] : NULL;
+    const char *arg2        = (argc > 2) ? argv[2] : NULL;
+    int   prompt_mode       = arg2 && strcmp(arg2, "-p") == 0;
+    const char *prompt_text = prompt_mode ? ((argc > 3) ? argv[3] : NULL) : NULL;
+    const char *tokens_path = prompt_mode ? NULL : arg2;
+    const char *third       = prompt_mode ? ((argc > 4) ? argv[4] : NULL)
+                                          : ((argc > 3) ? argv[3] : NULL);
     int   ppl_mode          = third && strcmp(third, "ppl") == 0;
     const char *dump_dir    = (third && !ppl_mode) ? third : NULL;
 #ifndef MLA_ENABLE_DUMP
@@ -1064,14 +1084,23 @@ int main(int argc, char *argv[]) {
     printf("Config: n_layers=%d hidden=%d vocab=%d\n",
            t.config.n_layers, t.config.hidden_size, t.config.vocab_size);
 
-    if (!tokens_path) {
-        printf("weights loaded; pass a tokens file to run prefill.\n");
+    if (!tokens_path && !prompt_mode) {
+        printf("weights loaded; pass a tokens file or -p \"text\" to run prefill.\n");
         free_transformer(&t);
         return 0;
     }
 
     int tokens[4096];
-    int n_prompt = read_tokens_i32(tokens_path, tokens, 4096);
+    int n_prompt;
+    if (prompt_mode) {
+        if (!prompt_text) { fprintf(stderr, "-p needs a text argument\n"); free_transformer(&t); return 1; }
+        if (!t.tokenizer) { fprintf(stderr, "no tokenizer.json in %s\n", model_dir); free_transformer(&t); return 1; }
+        /* add_bos=0: matches the oracle's tokenization (gen_oracle adds no special
+         * tokens) and the validated reference path. */
+        n_prompt = tokenizer_encode(t.tokenizer, prompt_text, 0, tokens, 4096);
+    } else {
+        n_prompt = read_tokens_i32(tokens_path, tokens, 4096);
+    }
     printf("Prompt: %d tokens [", n_prompt);
     for (int i = 0; i < n_prompt; i++) printf("%s%d", i ? ", " : "", tokens[i]);
     printf("]\n");

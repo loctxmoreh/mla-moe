@@ -1,6 +1,7 @@
 # Build artifacts
 /run
 /mla-moe
+/tests/tokenizer/tok_cli
 *.o
 
 # Validation dumps (regenerated from weights)
