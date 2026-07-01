@@ -46,9 +46,30 @@ GLM=/path/to/zai-org/GLM-4.7-Flash
 
 # same, but from a text prompt (tokenized + detokenized in C)
 ./run "$DSV" -p "The capital of France is"
+./run "$GLM" -p "The capital of France is"
 
 # (DUMP=1 build) prefill + one decode step, writing intermediates to <dump_dir>
 ./run "$GLM" tests/oracle/dumps/glm47/input_ids.i32.bin /tmp/cdump
+```
+
+## Tokenizer
+
+`-p "text"` drives an in-C byte-level BPE tokenizer (GPT-2 family) that reads
+the model's `tokenizer.json` (vocab + merges + added tokens) and `config.json`
+(bos/eos, model family).  Prompts are encoded with **no BOS**, matching the
+oracle's tokenization and the validated reference path.
+
+It is **faithful to HuggingFace for ASCII/English text**. The pre-tokenizer's
+non-ASCII letter/punctuation/CJK handling is intentionally omitted, so non-ASCII
+input still yields valid tokens but may split differently from HF.
+
+Cross-check the C tokenizer against HuggingFace on an ASCII panel (no model
+weights loaded):
+
+```sh
+make tok-cli   # builds tests/tokenizer/tok_cli
+uv run python tests/tokenizer/compare_hf.py "$DSV" ./tests/tokenizer/tok_cli
+uv run python tests/tokenizer/compare_hf.py "$GLM" ./tests/tokenizer/tok_cli
 ```
 
 ## Validate against the oracle
@@ -70,7 +91,5 @@ with `uv run python tests/oracle/gen_oracle.py <dsv2lite|glm47>` (see
 
 ## Limitations
 
-Single stream (batch=1), greedy sampling. The in-C tokenizer covers both
-DeepSeek-V2-Lite and GLM-4.7-Flash, and is faithful for ASCII/English text only
-(non-ASCII still yields valid tokens but may split differently from HF).
+Single stream (batch=1), greedy sampling, ASCII/English tokenizer (see above).
 Performance work (blocked matmuls, threading) is deferred — correctness first.
