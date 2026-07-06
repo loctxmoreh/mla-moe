@@ -8,38 +8,12 @@
 #include <math.h>
 
 #include "model.h"   /* Config/ModelWeights/RunState/Transformer + loader */
+#include "dump.h"    /* run_set_dump / DUMPING / DUMP_F32 / dump_prefill_layer0 */
 
 /* ---------------------------------------------------------------------------
  * Unabsorbed (prefill) forward pass.
  * bf16 weights, fp32 compute; one stream, whole prompt in one call.
  * ------------------------------------------------------------------------- */
-
-/* Validation dumps are compiled in only with -DMLA_ENABLE_DUMP (build with
- * `make DUMP=1`). By default DUMPING() is a compile-time 0, so every dump block
- * and its scratch is dead-code-eliminated — production builds carry no dump
- * code, branches, or I/O. Set the output dir at runtime via run_set_dump(). */
-#ifdef MLA_ENABLE_DUMP
-static const char *g_dump = NULL;
-void run_set_dump(const char *dir) { g_dump = dir; }
-#define DUMPING() (g_dump != NULL)
-
-static void dump_bin(const char *name, const void *p, size_t n, size_t elem) {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s.bin", g_dump, name);
-    FILE *f = fopen(path, "wb");
-    if (!f) { fprintf(stderr, "dump: cannot open %s\n", path); return; }
-    fwrite(p, elem, n, f);
-    fclose(f);
-}
-#define DUMP_F32(name, ptr, n) dump_bin(name, ptr, n, sizeof(float))
-#define DUMP_I32(name, ptr, n) dump_bin(name, ptr, n, sizeof(int32_t))
-#else
-void run_set_dump(const char *dir) { (void)dir; }
-#define DUMPING() 0
-/* discard args (marks them used) so dead dump blocks don't warn */
-#define DUMP_F32(name, ptr, n) ((void)(name), (void)(ptr), (void)(n))
-#define DUMP_I32(name, ptr, n) ((void)(name), (void)(ptr), (void)(n))
-#endif
 
 /* y = (x / rms(x)) * w, over n elements (RMSNorm). */
 static void rmsnorm(float *y, const float *x, const bf16_t *w, int n, float eps) {
@@ -343,35 +317,9 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt,
             snprintf(nm, sizeof(nm), "prefill_layer%02d_mlp_out", l);
             DUMP_F32(nm, mo, (size_t)n_prompt * H);
             memcpy(&hs[(size_t)(l + 1) * n_prompt * H], xs, (size_t)n_prompt * H * sizeof(float));
-            if (l == 0) {
-                /* layer-0 MLA internals, in the oracle's dump orders.
-                 * q_nope/q_pe are [n_heads, seq, dim] (heads-first, like k_nope). */
-                float *t1 = malloc((size_t)NH * n_prompt * QKN * sizeof(float));
-                for (int h = 0; h < NH; h++)
-                    for (int p = 0; p < n_prompt; p++)
-                        memcpy(&t1[((size_t)h * n_prompt + p) * QKN],
-                               &qall[((size_t)p * NH + h) * QHD], QKN * sizeof(float));
-                DUMP_F32("prefill_layer0_q_nope", t1, (size_t)NH * n_prompt * QKN);
-                float *t2 = malloc((size_t)NH * n_prompt * QKR * sizeof(float));
-                for (int h = 0; h < NH; h++)
-                    for (int p = 0; p < n_prompt; p++)
-                        memcpy(&t2[((size_t)h * n_prompt + p) * QKR],
-                               &qall[((size_t)p * NH + h) * QHD + QKN], QKR * sizeof(float));
-                DUMP_F32("prefill_layer0_q_pe", t2, (size_t)NH * n_prompt * QKR);
-                float *t3 = malloc((size_t)n_prompt * KVL * sizeof(float));
-                float *t4 = malloc((size_t)n_prompt * QKR * sizeof(float));
-                for (int p = 0; p < n_prompt; p++) {    /* c_kv [seq,kv_lora], k_pe [seq,qk_rope] */
-                    memcpy(&t3[(size_t)p * KVL], &kv_l[(size_t)p * KVD], KVL * sizeof(float));
-                    memcpy(&t4[(size_t)p * QKR], &kv_l[(size_t)p * KVD + KVL], QKR * sizeof(float));
-                }
-                DUMP_F32("prefill_layer0_c_kv", t3, (size_t)n_prompt * KVL);
-                DUMP_F32("prefill_layer0_k_pe", t4, (size_t)n_prompt * QKR);
-                DUMP_F32("prefill_layer0_k_nope", knope, (size_t)NH * n_prompt * QKN);
-                DUMP_F32("prefill_layer0_value", value, (size_t)NH * n_prompt * VHD);
-                DUMP_F32("prefill_layer0_attn_scores", scr, (size_t)NH * n_prompt * n_prompt);
-                DUMP_F32("prefill_layer0_attn_weights", wgt, (size_t)NH * n_prompt * n_prompt);
-                free(t1); free(t2); free(t3); free(t4);
-            }
+            if (l == 0)
+                dump_prefill_layer0(qall, kv_l, knope, value, scr, wgt,
+                                    NH, n_prompt, QKN, QKR, KVL, VHD);
         }
     }
 
