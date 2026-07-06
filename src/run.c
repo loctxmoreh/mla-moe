@@ -657,6 +657,15 @@ static void ffn_compute(const Config *c, ModelWeights *w, RunState *s, int l,
     if (topk_idx) for (int r = 0; r < K; r++) { topk_idx[r] = idx[r]; topk_w[r] = wts[r]; }
 }
 
+int sample(float *logits, int vocab_size);   /* greedy argmax; defined below */
+
+/* Per-position teacher-forced top-1 capture (optional out of forward_unabsorbed).
+ * For each scored position p in [0, n_prompt-1) (p predicts tokens[p+1]):
+ *   argmax[p] = engine's argmax id;  gap[p] = logits[argmax] - logits[gold].
+ * gap >= 0; gap == 0 iff the argmax matched the golden token (or an exact tie).
+ * Both arrays are caller-allocated with n_prompt entries. */
+typedef struct { int *argmax; float *gap; } TeacherForce;
+
 /* Teacher-forced negative log-likelihood of `target` under one logit row:
  * -log softmax(logits)[target]. Double accumulation; never materializes probs. */
 static double nll_at(const float *logits, int vocab, int target) {
@@ -674,7 +683,7 @@ static double nll_at(const float *logits, int vocab, int target) {
  * When built with -DMLA_ENABLE_DUMP and a dump dir is set, also writes the
  * oracle-named intermediates for validation. */
 float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt,
-                          double *nll_out) {
+                          double *nll_out, TeacherForce *tf) {
     const Config *c = &t->config;
     ModelWeights *w = &t->weights;
     RunState     *s = &t->state;
@@ -840,17 +849,26 @@ float *forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt,
     }
 
     /* final norm + lm_head */
-    if (nll_out) {
+    if (nll_out || tf) {
         /* teacher-forced scoring: lm_head per position into s->logits (reused as
-         * scratch), accumulate NLL against the next token; last row stays in
-         * s->logits for the return, matching the non-scoring contract. */
+         * scratch), score the next token; last row stays in s->logits for the
+         * return, matching the non-scoring contract. One vocab row at a time —
+         * never materializes a [seq, vocab] buffer (glm47 vocab is ~151k). */
         double sum_nll = 0.0;
         for (int p = 0; p < n_prompt; p++) {
             rmsnorm(xb, &xs[(size_t)p * H], w->norm, H, eps);
             matmul(s->logits, xb, w->lm_head, VOC, H);
-            if (p < n_prompt - 1) sum_nll += nll_at(s->logits, VOC, tokens[p + 1]);
+            if (p < n_prompt - 1) {
+                int gold = tokens[p + 1];
+                if (nll_out) sum_nll += nll_at(s->logits, VOC, gold);
+                if (tf) {
+                    int am = sample(s->logits, VOC);
+                    tf->argmax[p] = am;
+                    tf->gap[p]    = s->logits[am] - s->logits[gold];
+                }
+            }
         }
-        *nll_out = sum_nll;
+        if (nll_out) *nll_out = sum_nll;
     } else if (DUMPING()) {
         float *logits_all = malloc((size_t)n_prompt * VOC * sizeof(float));
         for (int p = 0; p < n_prompt; p++) {
@@ -1027,7 +1045,7 @@ static int read_tokens_i32(const char *path, int *out, int max) {
  * tokenizer is loaded. Stops early on EOS. */
 static void generate(Transformer *t, const int *prompt, int n_prompt, int max_new) {
     int eos = t->tokenizer ? tokenizer_eos_id(t->tokenizer) : -1;
-    float *logits = forward_unabsorbed(t, prompt, n_prompt, NULL);
+    float *logits = forward_unabsorbed(t, prompt, n_prompt, NULL, NULL);
     int tok = sample(logits, t->config.vocab_size);
     int pos = n_prompt;
     int *gen = malloc((size_t)max_new * sizeof(int)); int ng = 0;
@@ -1051,16 +1069,24 @@ static void generate(Transformer *t, const int *prompt, int n_prompt, int max_ne
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr,
-            "Usage: %s <model_dir> [tokens.i32.bin | -p \"text\"] [dump_dir|ppl]\n"
+            "Usage: %s <model_dir> [tokens.i32.bin | -p \"text\"] [MODE [ARG]]\n"
             "  model_dir: holds config.json, model.safetensors.index.json, shards\n"
             "             (model family auto-detected from config.json)\n"
-            "  no input        -> weight-load smoke test\n"
-            "  tokens file     -> prefill + greedy absorbed decode (prints token ids)\n"
-            "  -p \"text\"       -> tokenize text (needs tokenizer.json), then decode as above\n"
-            "  + dump_dir      -> prefill + ONE decode step, writing oracle-named\n"
-            "                     prefill_*/decode_* intermediates for validation\n"
-            "  + literal 'ppl' -> teacher-forced perplexity over the token sequence\n"
-            "                     (prints 'ppl <value>'); used by tests/oracle/compare_ppl.py\n", argv[0]);
+            "  no input          -> weight-load smoke test\n"
+            "  tokens file       -> prefill + greedy absorbed decode (prints token ids)\n"
+            "  -p \"text\"         -> tokenize text (needs tokenizer.json), then decode as above\n"
+            "  MODE = dump_dir   -> prefill + ONE decode step, writing oracle-named\n"
+            "                       prefill_*/decode_* intermediates for validation\n"
+            "  MODE = 'ppl'      -> teacher-forced perplexity over the token sequence\n"
+            "                       (prints 'ppl <value>'); used by tests/oracle/compare_ppl.py\n"
+            "  MODE = 'teacher' [prompt_len]\n"
+            "                    -> teacher-forced top-1 over the sequence, BOTH engine\n"
+            "                       paths: 'P' rows (prefill/unabsorbed) and 'D' rows\n"
+            "                       (decode/absorbed, positions >= prompt_len). Each row:\n"
+            "                       '<P|D> <pos> <gold> <argmax> <gap>'. Used by tests/eval/eval.py\n"
+            "  MODE = 'gen' [max_new]\n"
+            "                    -> greedy-decode max_new tokens; prints 'completion <ids...>'\n",
+            argv[0]);
         return 1;
     }
     const char *model_dir   = argv[1];
@@ -1070,8 +1096,12 @@ int main(int argc, char *argv[]) {
     const char *tokens_path = prompt_mode ? NULL : arg2;
     const char *third       = prompt_mode ? ((argc > 4) ? argv[4] : NULL)
                                           : ((argc > 3) ? argv[3] : NULL);
+    const char *fourth      = prompt_mode ? ((argc > 5) ? argv[5] : NULL)
+                                          : ((argc > 4) ? argv[4] : NULL);
     int   ppl_mode          = third && strcmp(third, "ppl") == 0;
-    const char *dump_dir    = (third && !ppl_mode) ? third : NULL;
+    int   teacher_mode      = third && strcmp(third, "teacher") == 0;
+    int   gen_mode          = third && strcmp(third, "gen") == 0;
+    const char *dump_dir    = (third && !ppl_mode && !teacher_mode && !gen_mode) ? third : NULL;
 #ifndef MLA_ENABLE_DUMP
     if (dump_dir)
         fprintf(stderr, "note: dump_dir given but dumps not compiled in "
@@ -1113,14 +1143,64 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         double nll = 0.0;
-        forward_unabsorbed(&t, tokens, n_prompt, &nll);
+        forward_unabsorbed(&t, tokens, n_prompt, &nll, NULL);
         int ntok = n_prompt - 1;
         printf("ppl %.6f\nnll %.6f tokens %d\n", exp(nll / ntok), nll, ntok);
+    } else if (teacher_mode) {
+        /* teacher-forced top-1 over the sequence, via BOTH engine paths.
+         * Feeds the GOLDEN token at every step (never the engine's own argmax),
+         * so a single flip cannot cascade. eval.py filters to the completion
+         * region (pos >= prompt_len) and applies the tie policy. */
+        if (n_prompt < 2) {
+            fprintf(stderr, "teacher needs >= 2 tokens (got %d)\n", n_prompt);
+            free_transformer(&t); return 1;
+        }
+        int VOC = t.config.vocab_size;
+        int prompt_len = fourth ? atoi(fourth) : 1;
+        if (prompt_len < 1) prompt_len = 1;
+        if (prompt_len >= n_prompt) prompt_len = n_prompt - 1;
+        printf("teacher_begin n_prompt=%d prompt_len=%d\n", n_prompt, prompt_len);
+
+        /* --- prefill / unabsorbed path: all positions in one forward --- */
+        TeacherForce tf = { malloc((size_t)n_prompt * sizeof(int)),
+                            malloc((size_t)n_prompt * sizeof(float)) };
+        forward_unabsorbed(&t, tokens, n_prompt, NULL, &tf);
+        for (int p = 0; p < n_prompt - 1; p++)   /* row keyed by predicted index p+1 */
+            printf("P %d %d %d %.6f\n", p + 1, tokens[p + 1], tf.argmax[p], tf.gap[p]);
+        free(tf.argmax); free(tf.gap);
+
+        /* --- decode / absorbed path: prefill the prompt, then step the
+         * completion region one GOLDEN token at a time through the KV cache.
+         * This is the actual inference path and the one that accumulates
+         * long-context / YaRN error over many steps. --- */
+        float *lg = forward_unabsorbed(&t, tokens, prompt_len, NULL, NULL);
+        for (int pos = prompt_len; pos < n_prompt; pos++) {
+            int gold = tokens[pos];
+            int am = sample(lg, VOC);
+            printf("D %d %d %d %.6f\n", pos, gold, am, lg[am] - lg[gold]);
+            if (pos + 1 < n_prompt) lg = forward_absorbed(&t, tokens[pos], pos);
+        }
+        printf("teacher_end\n");
+    } else if (gen_mode) {
+        /* greedy free-run for the fuzzy tier; emit the completion ids only. */
+        int max_new = fourth ? atoi(fourth) : 256;
+        int eos = t.tokenizer ? tokenizer_eos_id(t.tokenizer) : -1;
+        float *logits = forward_unabsorbed(&t, tokens, n_prompt, NULL, NULL);
+        int tok = sample(logits, t.config.vocab_size);
+        int pos = n_prompt;
+        printf("completion");
+        for (int i = 0; i < max_new && tok != eos; i++) {
+            printf(" %d", tok);
+            logits = forward_absorbed(&t, tok, pos);
+            tok = sample(logits, t.config.vocab_size);
+            pos++;
+        }
+        printf("\n");
     } else if (dump_dir) {
         /* validation scenario: prefill, then exactly one absorbed-decode step
          * (mirrors gen_oracle: feed the prefill argmax at position n_prompt). */
         run_set_dump(dump_dir);
-        float *logits = forward_unabsorbed(&t, tokens, n_prompt, NULL);
+        float *logits = forward_unabsorbed(&t, tokens, n_prompt, NULL, NULL);
         int next = sample(logits, t.config.vocab_size);
         printf("prefill argmax = %d  logit=%.6f\n", next, logits[next]);
         float *dlog = forward_absorbed(&t, next, n_prompt);

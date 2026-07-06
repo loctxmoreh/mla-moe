@@ -18,9 +18,36 @@ LIB_SRCS = src/safetensors_loader.c \
 RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/run.c
 TOOL_SRCS = $(LIB_SRCS) src/main.c
 
-.PHONY: all clean tok-cli
+.PHONY: all clean tok-cli eval eval-gen ref-binary
 
 all: run mla-moe
+
+# --- correctness eval -----------------------------------------------------
+# MODEL selects the dataset under tests/eval/<MODEL>/.
+MODEL ?= dsv2lite
+
+# Regenerate the frozen golden dataset from HF (greedy, fp32). Heavy: needs the
+# HF model + RAM. Run once per model; commit the resulting *.i32.txt/reference.json.
+eval-gen: run
+	uv run python tests/eval/gen_reference.py $(MODEL)
+
+# Score the C engine against the frozen dataset: teacher-forced top-1 (both
+# paths) + perplexity rel-err. Add FUZZY=1 for the METEOR/BERTScore free-run tier.
+eval: run
+	uv run python tests/eval/eval.py $(MODEL) $(if $(FUZZY),--fuzzy,)
+
+# Build the golden CPU reference binary `run-ref` from a TAGGED commit, isolated
+# from working-tree edits, so the GPU/HIP port always has a fixed, buildable
+# oracle to diff against: the golden reference is a tagged, buildable binary,
+# not the current run.c. Tag first: git tag $(REF).
+REF ?= cpu-oracle-v1
+ref-binary:
+	@git rev-parse --verify "$(REF)^{commit}" >/dev/null 2>&1 || \
+	  { echo "ref '$(REF)' not found -- tag the validated commit first: git tag $(REF)"; exit 1; }
+	rm -rf .ref-build && mkdir -p .ref-build && git archive "$(REF)" | tar -x -C .ref-build
+	$(MAKE) -C .ref-build run CC="$(CC)"
+	cp .ref-build/run run-ref && rm -rf .ref-build
+	@echo "built run-ref from $(REF)"
 
 # Standalone tokenizer harness (no model weights) for tests/tokenizer/compare_hf.py
 tok-cli: src/tokenizer.c vendor/cJSON.c tests/tokenizer/tok_cli.c

@@ -1,0 +1,38 @@
+{
+  "model": "glm47",
+  "model_dir": "/remote/vast0/share-mv/zai-org/GLM-4.7-Flash",
+  "max_new": 32,
+  "transformers_version": "5.12.1",
+  "requests": [
+    {
+      "prompt_len": 5,
+      "completion_len": 32,
+      "hf_nll": 38.41682815551758,
+      "hf_ntok": 36
+    },
+    {
+      "prompt_len": 25,
+      "completion_len": 32,
+      "hf_nll": 92.77490234375,
+      "hf_ntok": 56
+    },
+    {
+      "prompt_len": 11,
+      "completion_len": 32,
+      "hf_nll": 40.46842575073242,
+      "hf_ntok": 42
+    },
+    {
+      "prompt_len": 9,
+      "completion_len": 32,
+      "hf_nll": 38.83866500854492,
+      "hf_ntok": 40
+    },
+    {
+      "prompt_len": 930,
+      "completion_len": 32,
+      "hf_nll": 682.4835205078125,
+      "hf_ntok": 961
+    }
+  ]
+}

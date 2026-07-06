@@ -89,6 +89,34 @@ Use `glm47` + `$GLM` for the other model (argmax 12089). Regenerate the dumps
 with `uv run python tests/oracle/gen_oracle.py <dsv2lite|glm47>` (see
 `tests/oracle/README.md`; glm47 needs ~125 GB RAM).
 
+## Correctness eval
+
+The primary correctness gate scores the engine against a **frozen golden dataset**
+of greedy sequences generated once from HF (fp32), not per-tensor dumps. Three
+device-neutral metrics: teacher-forced top-1 agreement, perplexity relative error,
+and (optional) free-run METEOR/BERTScore.
+
+```sh
+# 1. generate the golden dataset from HF (greedy, fp32); run once per model
+make eval-gen MODEL=dsv2lite        # writes tests/eval/dsv2lite/{prompts,completions}.i32.txt, reference.json
+
+# 2. score the C engine (teacher-forced top-1 both paths + ppl rel-err)
+make eval MODEL=dsv2lite            # add FUZZY=1 for the METEOR/BERTScore tier
+```
+
+The engine exposes the eval modes directly:
+
+```sh
+./run "$DSV" seq.i32.bin teacher 5  # teacher-forced top-1: 'P'/'D' rows, decode region pos>=5
+./run "$DSV" prompt.i32.bin gen 64  # greedy free-run; prints 'completion <ids>'
+```
+
+For the GPU/HIP port, freeze the validated CPU engine as a **tagged, buildable**
+reference (not the mutating `run.c`): `git tag cpu-oracle-v1 && make ref-binary`
+builds `run-ref` from that tag to diff kernels against. The per-tensor oracle
+(`tests/oracle/`, below) is retained as the bring-up microscope for localizing a
+failing kernel.
+
 ## Limitations
 
 Single stream (batch=1), greedy sampling, ASCII/English tokenizer (see above).

@@ -1,0 +1,6 @@
+{
+  "top1_strict": 0.99,
+  "ppl_rel": 0.01,
+  "meteor": 0.3,
+  "bertscore_f1": 0.9
+}

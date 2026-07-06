@@ -1,12 +1,19 @@
 # Build artifacts
 /run
 /mla-moe
+/run-ref
+/.ref-build/
 /tests/tokenizer/tok_cli
 *.o
 
 # Validation dumps (regenerated from weights)
 /tests/weight_loading/dumps/
 /tests/oracle/dumps/
+
+# NOTE: the eval golden dataset (tests/eval/*/{prompts,completions}.i32.txt,
+# reference.json) IS tracked on purpose -- it is the frozen, versioned gate and
+# is expensive to regenerate (glm47 needs ~125 GB HF). Unlike the oracle dumps
+# above, it is tiny (token ids) and must not depend on re-running HF.
 
 # Python
 __pycache__/
