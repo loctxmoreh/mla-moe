@@ -15,7 +15,7 @@ LIB_SRCS = src/safetensors_loader.c \
 # Two binaries:
 #   run      — llama2.c-style inference entry point (src/run.c)
 #   mla-moe  — weight inspection CLI (src/main.c)
-RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/run.c
+RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/model_load.c src/run.c
 TOOL_SRCS = $(LIB_SRCS) src/main.c
 
 .PHONY: all clean tok-cli eval eval-gen ref-binary
