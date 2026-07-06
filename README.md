@@ -117,6 +117,33 @@ builds `run-ref` from that tag to diff kernels against. The per-tensor oracle
 (`tests/oracle/`, below) is retained as the bring-up microscope for localizing a
 failing kernel.
 
+## Benchmark
+
+Performance is measured as **two separate regimes** — they have opposite compute
+profiles: prefill is compute-bound dense GEMM, decode is memory-bound with
+per-token MoE routing. The engine's `bench` mode owns the wall-clock timing;
+`tests/bench/bench.py` sweeps prefill lengths and reports both.
+
+```sh
+make bench MODEL=dsv2lite                       # sweep default prefill lengths
+make bench MODEL=glm47 PREFILL=256,1024 DECODE=32 REPS=7 OUT=/tmp/glm.json
+```
+
+Reported per prefill length: prefill tok/s (`prefill_ms` **is** time-to-first-token,
+since the first output token is the argmax of prefill's logits), decode tok/s, and
+TPOT (time-per-output-token). rep 0 is a warmup and excluded from the medians.
+
+The timing is **device-agnostic**: it brackets the forward calls inside `run`,
+whose host-side logits force any backend to synchronize at the clock boundary.
+So the same harness measures a CPU build, `run-ref`, or a future GPU/HIP build —
+just point `-r`/`RUN` at the binary. `--compare` prints per-regime speedup, the
+perf analogue of the `run` vs `run-ref` correctness diff:
+
+```sh
+uv run python tests/bench/bench.py dsv2lite -r ./run-ref -o /tmp/base.json
+uv run python tests/bench/bench.py dsv2lite -r ./run     -o /tmp/cur.json --compare /tmp/base.json
+```
+
 ## Limitations
 
 Single stream (batch=1), greedy sampling, ASCII/English tokenizer (see above).

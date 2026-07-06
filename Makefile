@@ -18,7 +18,7 @@ LIB_SRCS = src/safetensors_loader.c \
 RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/model_load.c src/dump.c src/run.c
 TOOL_SRCS = $(LIB_SRCS) src/main.c
 
-.PHONY: all clean tok-cli eval eval-gen ref-binary
+.PHONY: all clean tok-cli eval eval-gen ref-binary bench
 
 all: run mla-moe
 
@@ -35,6 +35,15 @@ eval-gen: run
 # paths) + perplexity rel-err. Add FUZZY=1 for the METEOR/BERTScore free-run tier.
 eval: run
 	uv run python tests/eval/eval.py $(MODEL) $(if $(FUZZY),--fuzzy,)
+
+# --- performance benchmark ------------------------------------------------
+# Device-agnostic prefill/decode perf. Point -r/RUN at any engine build (CPU,
+# run-ref, or a future GPU binary). Override PREFILL/DECODE/REPS/OUT as needed.
+bench: run
+	uv run python tests/bench/bench.py $(MODEL) \
+	  $(if $(RUN),-r $(RUN),) $(if $(PREFILL),--prefill $(PREFILL),) \
+	  $(if $(DECODE),--decode $(DECODE),) $(if $(REPS),--reps $(REPS),) \
+	  $(if $(OUT),-o $(OUT),) $(if $(COMPARE),--compare $(COMPARE),)
 
 # Build the golden CPU reference binary `run-ref` from a TAGGED commit, isolated
 # from working-tree edits, so the GPU/HIP port always has a fixed, buildable

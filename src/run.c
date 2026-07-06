@@ -2,10 +2,12 @@
  * forward_unabsorbed() (whole-prompt prefill) and forward_absorbed() (one-token
  * decode) are both oracle-validated for dsv2lite AND glm47 within tol=2e-3.
  * Config (incl. model family) is read from <model_dir>/config.json. */
+#define _POSIX_C_SOURCE 199309L   /* clock_gettime / CLOCK_MONOTONIC (bench mode) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #include "model.h"   /* Config/ModelWeights/RunState/Transformer + loader */
 #include "dump.h"    /* run_set_dump / DUMPING / DUMP_F32 / dump_prefill_layer0 */
@@ -541,6 +543,77 @@ static void generate(Transformer *t, const int *prompt, int n_prompt, int max_ne
     free(gen);
 }
 
+/* Monotonic wall-clock in ms — the timing primitive for `bench` mode. */
+static double now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
+}
+
+/* Median of n doubles (insertion sort on a scratch copy; n is tiny). */
+static double median_double(const double *v, int n) {
+    double *s = malloc((size_t)n * sizeof(double));
+    memcpy(s, v, (size_t)n * sizeof(double));
+    for (int i = 1; i < n; i++) {
+        double key = s[i]; int j = i - 1;
+        while (j >= 0 && s[j] > key) { s[j + 1] = s[j]; j--; }
+        s[j + 1] = key;
+    }
+    double m = (n & 1) ? s[n / 2] : 0.5 * (s[n / 2 - 1] + s[n / 2]);
+    free(s);
+    return m;
+}
+
+/* Device-agnostic prefill/decode benchmark. Wall-clock brackets the two forward
+ * entry points; both return host logits, so any backend (incl. a future GPU
+ * port) has synchronized by the time the clock stops. reps>1: rep 0 is warmup
+ * (cold pages / allocs) and excluded from the median summary. prefill_ms is the
+ * time-to-first-token (the first output token is sample() of prefill's logits). */
+static void run_bench(Transformer *t, const int *tokens, int n_prompt,
+                      int n_decode, int reps) {
+    int VOC = t->config.vocab_size;
+    if (n_prompt + n_decode > t->config.max_seq_len) {
+        fprintf(stderr, "bench: n_prompt+n_decode (%d) > max_seq_len (%d)\n",
+                n_prompt + n_decode, t->config.max_seq_len);
+        return;
+    }
+    int keep = reps > 1 ? reps - 1 : reps;   /* summary excludes warmup rep 0 */
+    double *pf_ms   = malloc((size_t)keep * sizeof(double));
+    double *pf_toks = malloc((size_t)keep * sizeof(double));
+    double *dc_toks = malloc((size_t)keep * sizeof(double));
+    double *tpot    = malloc((size_t)keep * sizeof(double));
+    int k = 0;
+    for (int r = 0; r < reps; r++) {
+        double t0 = now_ms();
+        float *lg = forward_unabsorbed(t, tokens, n_prompt, NULL, NULL);
+        double prefill_ms = now_ms() - t0;
+        int tok = sample(lg, VOC);
+
+        double d0 = now_ms();
+        for (int pos = n_prompt; pos < n_prompt + n_decode; pos++) {
+            lg = forward_absorbed(t, tok, pos);
+            tok = sample(lg, VOC);
+        }
+        double decode_ms = now_ms() - d0;
+
+        double pf_ts = (double)n_prompt / (prefill_ms / 1e3);
+        double dc_ts = (double)n_decode / (decode_ms / 1e3);
+        double tp    = decode_ms / (double)n_decode;
+        printf("bench rep=%d prefill_tokens=%d prefill_ms=%.3f prefill_tok_s=%.2f "
+               "decode_tokens=%d decode_ms=%.3f decode_tok_s=%.2f tpot_ms=%.3f\n",
+               r, n_prompt, prefill_ms, pf_ts, n_decode, decode_ms, dc_ts, tp);
+        if (reps > 1 && r == 0) continue;    /* warmup rep excluded from summary */
+        pf_ms[k] = prefill_ms; pf_toks[k] = pf_ts;
+        dc_toks[k] = dc_ts; tpot[k] = tp; k++;
+    }
+    printf("bench_summary prefill_tokens=%d decode_tokens=%d reps=%d "
+           "prefill_ms_median=%.3f prefill_tok_s_median=%.2f "
+           "decode_tok_s_median=%.2f tpot_ms_median=%.3f\n",
+           n_prompt, n_decode, k,
+           median_double(pf_ms, k), median_double(pf_toks, k),
+           median_double(dc_toks, k), median_double(tpot, k));
+    free(pf_ms); free(pf_toks); free(dc_toks); free(tpot);
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr,
@@ -560,7 +633,11 @@ int main(int argc, char *argv[]) {
             "                       (decode/absorbed, positions >= prompt_len). Each row:\n"
             "                       '<P|D> <pos> <gold> <argmax> <gap>'. Used by tests/eval/eval.py\n"
             "  MODE = 'gen' [max_new]\n"
-            "                    -> greedy-decode max_new tokens; prints 'completion <ids...>'\n",
+            "                    -> greedy-decode max_new tokens; prints 'completion <ids...>'\n"
+            "  MODE = 'bench' [n_decode] [reps]\n"
+            "                    -> device-agnostic perf: time prefill (n_prompt tokens) and\n"
+            "                       decode (n_decode steps), reps times (rep 0 = warmup); prints\n"
+            "                       'bench ...' per rep + a 'bench_summary ...' median line\n",
             argv[0]);
         return 1;
     }
@@ -573,10 +650,14 @@ int main(int argc, char *argv[]) {
                                           : ((argc > 3) ? argv[3] : NULL);
     const char *fourth      = prompt_mode ? ((argc > 5) ? argv[5] : NULL)
                                           : ((argc > 4) ? argv[4] : NULL);
+    const char *fifth       = prompt_mode ? ((argc > 6) ? argv[6] : NULL)
+                                          : ((argc > 5) ? argv[5] : NULL);
     int   ppl_mode          = third && strcmp(third, "ppl") == 0;
     int   teacher_mode      = third && strcmp(third, "teacher") == 0;
     int   gen_mode          = third && strcmp(third, "gen") == 0;
-    const char *dump_dir    = (third && !ppl_mode && !teacher_mode && !gen_mode) ? third : NULL;
+    int   bench_mode        = third && strcmp(third, "bench") == 0;
+    const char *dump_dir    = (third && !ppl_mode && !teacher_mode && !gen_mode
+                               && !bench_mode) ? third : NULL;
 #ifndef MLA_ENABLE_DUMP
     if (dump_dir)
         fprintf(stderr, "note: dump_dir given but dumps not compiled in "
@@ -606,9 +687,13 @@ int main(int argc, char *argv[]) {
     } else {
         n_prompt = read_tokens_i32(tokens_path, tokens, 4096);
     }
-    printf("Prompt: %d tokens [", n_prompt);
-    for (int i = 0; i < n_prompt; i++) printf("%s%d", i ? ", " : "", tokens[i]);
-    printf("]\n");
+    if (bench_mode) {
+        printf("Prompt: %d tokens\n", n_prompt);   /* quiet: skip the id dump */
+    } else {
+        printf("Prompt: %d tokens [", n_prompt);
+        for (int i = 0; i < n_prompt; i++) printf("%s%d", i ? ", " : "", tokens[i]);
+        printf("]\n");
+    }
 
     if (ppl_mode) {
         /* teacher-forced perplexity over the token sequence (n_prompt-1 targets) */
@@ -671,6 +756,12 @@ int main(int argc, char *argv[]) {
             pos++;
         }
         printf("\n");
+    } else if (bench_mode) {
+        int n_decode = fourth ? atoi(fourth) : 64;
+        int reps     = fifth  ? atoi(fifth)  : 5;
+        if (n_decode < 1) n_decode = 1;
+        if (reps < 1)     reps = 1;
+        run_bench(&t, tokens, n_prompt, n_decode, reps);
     } else if (dump_dir) {
         /* validation scenario: prefill, then exactly one absorbed-decode step
          * (mirrors gen_oracle: feed the prefill argmax at position n_prompt). */
