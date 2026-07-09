@@ -15,10 +15,11 @@ LIB_SRCS = src/safetensors_loader.c \
 # Two binaries:
 #   run      — llama2.c-style inference entry point (src/run.c)
 #   mla-moe  — weight inspection CLI (src/main.c)
-RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/model_load.c src/dump.c src/run.c
+RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/model_load.c src/dump.c \
+            src/getp_eval.c src/getp_run.c src/run.c
 TOOL_SRCS = $(LIB_SRCS) src/main.c
 
-.PHONY: all clean tok-cli eval eval-gen ref-binary bench
+.PHONY: all clean tok-cli eval eval-gen ref-binary bench getp
 
 all: run mla-moe
 
@@ -44,6 +45,16 @@ bench: run
 	  $(if $(RUN),-r $(RUN),) $(if $(PREFILL),--prefill $(PREFILL),) \
 	  $(if $(DECODE),--decode $(DECODE),) $(if $(REPS),--reps $(REPS),) \
 	  $(if $(OUT),-o $(OUT),) $(if $(COMPARE),--compare $(COMPARE),)
+
+# Batch-throughput grading (the perf score). Runs the fixed request set through
+# the candidate's inference() (src/getp_run.c) and prints one tok/s number.
+# MODEL selects tests/eval/<MODEL>/requests.txt; MODELDIR points at the weights
+# (defaults to $DSV / $GLM per model). Override STEPS/OUT as needed.
+MODELDIR ?= $(if $(filter glm47,$(MODEL)),$(GLM),$(DSV))
+getp: run
+	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
+	./run "$(MODELDIR)" getp tests/eval/$(MODEL)/requests.txt \
+	  $(if $(OUT),$(OUT),/tmp/getp_$(MODEL).txt) $(if $(STEPS),$(STEPS),)
 
 # Build the golden CPU reference binary `run-ref` from a TAGGED commit, isolated
 # from working-tree edits, so the GPU/HIP port always has a fixed, buildable

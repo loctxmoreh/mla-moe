@@ -7,9 +7,24 @@ one readable C codebase where every operation is explicit and auditable.
 
 **Targets:** DeepSeek-V2-Lite (`deepseek_v2`) and GLM-4.7-Flash (`glm4_moe_lite`).
 
-## Build
+## Environment setup
 
-The Makefile defaults `CC` to `/opt/rocm/llvm/bin/clang`:
+- **Toolchain**: the Makefile defaults `CC` to `/opt/rocm/llvm/bin/clang`;
+  override with `make CC=...` if that path doesn't exist on your machine.
+- **Python tooling**: `uv sync` installs the pinned deps from `pyproject.toml`
+  (numpy, safetensors, transformers, accelerate, torch-cpu) — run this once
+  before any `uv run python ...` command below.
+- **Model weights**: checkpoints are plain HF directories (`config.json` +
+  `model.safetensors.index.json` + shards), mmap'd directly — no download or
+  conversion step. On the shared cluster they live at
+  `/remote/vast0/share-mv/<hf-org>/<hf-model>`, e.g.
+  `/remote/vast0/share-mv/deepseek-ai/DeepSeek-V2-Lite` and
+  `/remote/vast0/share-mv/zai-org/GLM-4.7-Flash` (same convention used by
+  `tests/eval/*/reference.json` and `tests/oracle/gen_oracle.py`). Export
+  `DSV=`/`GLM=` pointing at those paths, or at your own local copy of the same
+  layout.
+
+## Build
 
 ```sh
 make                 # optimized; builds `run` (engine) and `mla-moe` (weight inspector)
@@ -33,6 +48,8 @@ is raw little-endian int32 token ids (the oracle's `input_ids.i32.bin` files are
 exactly this). Alternatively, `-p "text"` tokenizes a prompt with the in-C
 tokenizer (reads `tokenizer.json`; pre-tokenizer chosen from `config.json`), and
 generated ids are decoded back to text.
+
+See "Environment setup" above for where `DSV`/`GLM` actually point on this cluster.
 
 ```sh
 DSV=/path/to/deepseek-ai/DeepSeek-V2-Lite
@@ -144,7 +161,52 @@ uv run python tests/bench/bench.py dsv2lite -r ./run-ref -o /tmp/base.json
 uv run python tests/bench/bench.py dsv2lite -r ./run     -o /tmp/cur.json --compare /tmp/base.json
 ```
 
+## Candidate task & throughput grading (`getp`)
+
+This is the intern exam surface, mirroring last year's gpt-oss layout: a working
+CPU baseline that you optimize by porting the compute to the GPU.
+
+**You modify exactly one file: `src/getp_run.c`.** It implements `warm_up()`,
+`finish()`, and `inference()` (contract in `include/getp.h`). Everything else is
+frozen — `src/run.c` and its forward kernels, `src/getp_eval.c` (the timing
+harness), `model_load.c`, `tokenizer.c`, `main.c`, `tests/`, and `include/*`.
+The frozen CPU kernels are declared in `include/engine.h`; the reference
+`inference()` calls them, so it is correct on day one. Replace those calls with
+your own GPU kernels incrementally.
+
+`getp` mode runs a fixed request set (`requests.txt`: line 0 = count, then one
+prompt per line) through your `inference()` and prints one end-to-end number —
+the perf score:
+
+```sh
+DSV=/path/to/deepseek-ai/DeepSeek-V2-Lite
+./run "$DSV" getp tests/eval/dsv2lite/requests.txt /tmp/out.txt 128
+# -> "achieved throughput TPS (tok/s): <score>"; writes generated ids to /tmp/out.txt
+
+make getp MODEL=dsv2lite MODELDIR="$DSV"     # convenience wrapper (STEPS/OUT overridable)
+```
+
+`warm_up()`/`finish()` are timed separately and excluded from the throughput
+number — do allocation and weight upload there, not inside `inference()`.
+
+**Correctness gate:** raising throughput must not change the output. `make eval
+MODEL=...` (teacher-forced top-1 + perplexity; `--fuzzy` adds METEOR/BERTScore)
+is the correctness gate and must keep passing its thresholds.
+
 ## Limitations
 
 Single stream (batch=1), greedy sampling, ASCII/English tokenizer (see above).
 Performance work (blocked matmuls, threading) is deferred — correctness first.
+
+## Candidate hand-off — status
+
+The hand-off scaffolding now exists and mirrors last year's gpt-oss split:
+`src/getp_eval.c` is the frozen timing harness (analogue of `getp_eval.cpp`) and
+`src/getp_run.c` is the sole editable file (analogue of `getp_run.cpp`). See
+**Candidate task & throughput grading** above.
+
+Open decision for the exam author: whether `Makefile` stays frozen. A GPU/HIP
+port generally needs a different compiler/flags, so `Makefile` is intentionally
+**not** on the frozen list yet — last year's gpt-oss Makefile was frozen but
+pre-set to `hipcc --offload-arch=gfx90a`. Decide the GPU toolchain, then either
+pre-set `CC`/flags here and freeze it, or leave it candidate-editable.
