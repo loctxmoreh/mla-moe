@@ -11,6 +11,7 @@
 
 #include "model.h"   /* Config/ModelWeights/RunState/Transformer + loader */
 #include "dump.h"    /* run_set_dump / DUMPING / DUMP_F32 / dump_prefill_layer0 */
+#include "getp.h"    /* getp() batch-throughput harness (perf grading surface) */
 
 /* ---------------------------------------------------------------------------
  * Unabsorbed (prefill) forward pass.
@@ -637,12 +638,18 @@ int main(int argc, char *argv[]) {
             "  MODE = 'bench' [n_decode] [reps]\n"
             "                    -> device-agnostic perf: time prefill (n_prompt tokens) and\n"
             "                       decode (n_decode steps), reps times (rep 0 = warmup); prints\n"
-            "                       'bench ...' per rep + a 'bench_summary ...' median line\n",
+            "                       'bench ...' per rep + a 'bench_summary ...' median line\n"
+            "  'getp' <requests.txt> <output.txt> [steps]\n"
+            "                    -> batch-throughput grading: warm_up, then timed inference over\n"
+            "                       the request set (line 0 = count, then one prompt/line); prints\n"
+            "                       'achieved throughput TPS (tok/s)' and writes generated ids.\n"
+            "                       The candidate's inference() lives in src/getp_run.c\n",
             argv[0]);
         return 1;
     }
     const char *model_dir   = argv[1];
     const char *arg2        = (argc > 2) ? argv[2] : NULL;
+    int   getp_mode         = arg2 && strcmp(arg2, "getp") == 0;
     int   prompt_mode       = arg2 && strcmp(arg2, "-p") == 0;
     const char *prompt_text = prompt_mode ? ((argc > 3) ? argv[3] : NULL) : NULL;
     const char *tokens_path = prompt_mode ? NULL : arg2;
@@ -657,7 +664,7 @@ int main(int argc, char *argv[]) {
     int   gen_mode          = third && strcmp(third, "gen") == 0;
     int   bench_mode        = third && strcmp(third, "bench") == 0;
     const char *dump_dir    = (third && !ppl_mode && !teacher_mode && !gen_mode
-                               && !bench_mode) ? third : NULL;
+                               && !bench_mode && !getp_mode) ? third : NULL;
 #ifndef MLA_ENABLE_DUMP
     if (dump_dir)
         fprintf(stderr, "note: dump_dir given but dumps not compiled in "
@@ -669,6 +676,21 @@ int main(int argc, char *argv[]) {
     printf("Loaded %zu tensors\n", st_count(t.store));
     printf("Config: n_layers=%d hidden=%d vocab=%d\n",
            t.config.n_layers, t.config.hidden_size, t.config.vocab_size);
+
+    if (getp_mode) {
+        const char *req_file = (argc > 3) ? argv[3] : NULL;
+        const char *out_file = (argc > 4) ? argv[4] : NULL;
+        int         steps    = (argc > 5) ? atoi(argv[5]) : 0;
+        if (!req_file || !out_file) {
+            fprintf(stderr, "getp: usage: %s <model_dir> getp <requests.txt> "
+                            "<output.txt> [steps]\n", argv[0]);
+            free_transformer(&t);
+            return 1;
+        }
+        getp(&t, req_file, out_file, steps);
+        free_transformer(&t);
+        return 0;
+    }
 
     if (!tokens_path && !prompt_mode) {
         printf("weights loaded; pass a tokens file or -p \"text\" to run prefill.\n");

@@ -13,7 +13,7 @@ then freezes everything device-neutrally under `<model>/`:
 
   requests.txt          human-readable prompts (first line = count, then N lines)
   prompts.i32.txt       canonical prompt token ids, one space-separated line each
-  completions.i32.txt   greedy completion token ids, one line each (gpt-oss format)
+  completions.i32.txt   greedy completion token ids, one space-separated line each
   reference.json        per-request {prompt_len, completion_len, hf_nll, hf_ntok}
                         + provenance (model_dir, max_new, transformers version)
 
