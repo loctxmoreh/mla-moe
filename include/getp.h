@@ -3,8 +3,8 @@
  * `getp()` (frozen, src/getp_eval.c) reads a fixed request set, brackets the
  * candidate's inference() with a wall clock, and prints one end-to-end number:
  *   achieved throughput TPS (tok/s)
- * This mirrors last year's gpt-oss getp mode. The candidate implements the
- * three functions below in src/getp_run.c (the ONLY file they may modify). */
+ * The candidate implements the three functions below in src/getp_run.c (the
+ * ONLY file they may modify). */
 #ifndef MLA_GETP_H
 #define MLA_GETP_H
 

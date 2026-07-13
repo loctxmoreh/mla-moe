@@ -163,8 +163,8 @@ uv run python tests/bench/bench.py dsv2lite -r ./run     -o /tmp/cur.json --comp
 
 ## Candidate task & throughput grading (`getp`)
 
-This is the intern exam surface, mirroring last year's gpt-oss layout: a working
-CPU baseline that you optimize by porting the compute to the GPU.
+This is the intern exam surface: a working CPU baseline that you optimize by
+porting the compute to the GPU.
 
 **You modify exactly one file: `src/getp_run.c`.** It implements `warm_up()`,
 `finish()`, and `inference()` (contract in `include/getp.h`). Everything else is
@@ -200,13 +200,11 @@ Performance work (blocked matmuls, threading) is deferred — correctness first.
 
 ## Candidate hand-off — status
 
-The hand-off scaffolding now exists and mirrors last year's gpt-oss split:
-`src/getp_eval.c` is the frozen timing harness (analogue of `getp_eval.cpp`) and
-`src/getp_run.c` is the sole editable file (analogue of `getp_run.cpp`). See
-**Candidate task & throughput grading** above.
+The hand-off scaffolding now exists with a frozen/editable split:
+`src/getp_eval.c` is the frozen timing harness and `src/getp_run.c` is the sole
+editable file. See **Candidate task & throughput grading** above.
 
 Open decision for the exam author: whether `Makefile` stays frozen. A GPU/HIP
 port generally needs a different compiler/flags, so `Makefile` is intentionally
-**not** on the frozen list yet — last year's gpt-oss Makefile was frozen but
-pre-set to `hipcc --offload-arch=gfx90a`. Decide the GPU toolchain, then either
-pre-set `CC`/flags here and freeze it, or leave it candidate-editable.
+**not** on the frozen list yet. Decide the GPU toolchain, then either pre-set
+`CC`/flags here and freeze it, or leave it candidate-editable.

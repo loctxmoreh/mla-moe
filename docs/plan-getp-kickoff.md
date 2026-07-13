@@ -1,16 +1,15 @@
-# Plan — build the candidate "kickoff" scaffolding (parity with last year's gpt-oss)
+# Plan — build the candidate "kickoff" scaffolding
 
 ## Goal
-Bring `mla-moe` to the same starting state last year's `gpt-oss` exam handed to
-candidates: a runnable CPU engine + **a single editable file** + **one command
-that produces a single throughput number (tok/s) over a fixed workload** (the
-perf score), while correctness is gated by the existing harness (`make eval`).
-The task is the same shape as last year: a CPU baseline that candidates port to
-GPU kernels themselves.
+Bring `mla-moe` to a candidate-ready starting state: a runnable CPU engine +
+**a single editable file** + **one command that produces a single throughput
+number (tok/s) over a fixed workload** (the perf score), while correctness is
+gated by the existing harness (`make eval`). The task shape: a CPU baseline
+that candidates port to GPU kernels themselves.
 
-## Last year → this year mapping
+## Reference layout → mla-moe mapping
 
-| Last year (gpt-oss) | Role | This year — status | Action |
+| Reference layout | Role | mla-moe — status | Action |
 |---|---|---|---|
 | `run.cpp` (frozen) with `forward()` | engine + reference oracle | `src/run.c` `forward_unabsorbed`/`forward_absorbed` (oracle-validated) | KEEP frozen, expose prototypes via `include/engine.h` |
 | `getp-csrc/getp_eval.cpp` (frozen) | read batch, time, print `achieved throughput TPS (tok/s)`, write output | — MISSING | ADD `src/getp_eval.c` + `include/getp.h` |
@@ -24,15 +23,13 @@ GPU kernels themselves.
 ## Frozen / editable split (design decision)
 - **Editable (the submission): `src/getp_run.c` only.** Candidates can (a) call
   the reference CPU `forward_*` to be correct immediately, then (b) replace them
-  incrementally with GPU kernels written in this same file. This is exactly last
-  year's model: the frozen CPU forward is the oracle, the candidate writes the
-  fast path in their own file.
+  incrementally with GPU kernels written in this same file. The frozen CPU
+  forward is the oracle; the candidate writes the fast path in their own file.
 - **Frozen:** `run.c`, `model_load.c`, `safetensors_loader.c`, `tokenizer.c`,
   `dump.c`, `main.c`, `getp_eval.c`, all of `tests/`, and `include/*`.
 - **Point to confirm (judgment call):** a GPU port may require a different
-  compiler/flags in `Makefile` (last year's gpt-oss Makefile was frozen but
-  pre-set to `hipcc --offload-arch=gfx90a`; this year defaults to `clang`). I
-  left `Makefile` **off** the hard frozen list and documented it, rather than
+  compiler/flags in `Makefile` than the current `clang` default. I left
+  `Makefile` **off** the hard frozen list and documented it, rather than
   unilaterally freezing it.
 
 ## How throughput is measured (frozen harness)

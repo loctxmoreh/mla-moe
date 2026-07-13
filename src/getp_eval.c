@@ -3,8 +3,7 @@
  * Frozen batch-throughput harness. Reads a fixed request set, times the
  * candidate's inference(), and reports one end-to-end number:
  *   achieved throughput TPS (tok/s)
- * warm_up() and finish() are timed separately and excluded from throughput.
- * Ported in spirit from last year's gpt-oss getp-csrc/getp_eval.cpp. */
+ * warm_up() and finish() are timed separately and excluded from throughput. */
 #define _POSIX_C_SOURCE 200809L   /* clock_gettime + getline / strdup / ssize_t */
 #include <stdio.h>
 #include <stdlib.h>
