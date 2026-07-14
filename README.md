@@ -9,8 +9,11 @@ one readable C codebase where every operation is explicit and auditable.
 
 ## Environment setup
 
-- **Toolchain**: the Makefile defaults `CC` to `/opt/rocm/llvm/bin/clang`;
-  override with `make CC=...` if that path doesn't exist on your machine.
+- **Toolchain**: the Makefile is **frozen** to `hipcc --offload-arch=gfx90a`
+  (MI250 / CDNA2). The CPU reference builds and runs as ordinary host code under
+  it; candidates add HIP device kernels against this same target. (For CPU-only
+  dev off an MI250 box you can `make CC=clang` locally, but the frozen Makefile
+  is what grades.)
 - **Python tooling**: `uv sync` installs the pinned deps from `pyproject.toml`
   (numpy, safetensors, transformers, accelerate, torch-cpu) — run this once
   before any `uv run python ...` command below.
@@ -204,7 +207,9 @@ The hand-off scaffolding now exists with a frozen/editable split:
 `src/getp_eval.c` is the frozen timing harness and `src/getp_run.c` is the sole
 editable file. See **Candidate task & throughput grading** above.
 
-Open decision for the exam author: whether `Makefile` stays frozen. A GPU/HIP
-port generally needs a different compiler/flags, so `Makefile` is intentionally
-**not** on the frozen list yet. Decide the GPU toolchain, then either pre-set
-`CC`/flags here and freeze it, or leave it candidate-editable.
+The `Makefile` is **frozen**, pre-set to the GPU toolchain `hipcc
+--offload-arch=gfx90a` (MI250 / CDNA2). The CPU reference compiles and runs as
+host code under hipcc (verified), so it is correct on day one; candidates write
+HIP kernels in `src/getp_run.c` against the same target. Frozen list: `Makefile`,
+`src/run.c` and its kernels, `src/getp_eval.c`, `model_load.c`, `tokenizer.c`,
+`main.c`, `tests/`, `include/*` — **editable: `src/getp_run.c` only.**

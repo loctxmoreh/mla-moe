@@ -1,5 +1,9 @@
-CC      = /opt/rocm/llvm/bin/clang
-CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wpedantic \
+# FROZEN exam toolchain: hipcc targeting MI250 (gfx90a / CDNA2). The CPU
+# reference builds and runs as ordinary host code under hipcc on day one;
+# candidates add HIP device kernels in src/getp_run.c against this same target.
+# Do not edit — the Makefile is on the frozen list (see README).
+CC      = hipcc
+CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wpedantic --offload-arch=gfx90a \
           -Iinclude -Ivendor
 LDFLAGS = -lm
 
