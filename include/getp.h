@@ -10,6 +10,10 @@
 
 #include "model.h"   /* Transformer */
 
+#ifdef __cplusplus
+extern "C" {   /* C linkage: getp_run.hip *defines* these; the C harness calls them */
+#endif
+
 /* One batch of text prompts + their generated token ids. Owned/managed by the
  * frozen harness; the driver reads prompts[] and fills out_tokens[]/out_lens[]. */
 typedef struct {
@@ -30,5 +34,9 @@ long long inference(Transformer *t, Requests *reqs);  /* returns total tokens ge
  * finish, prints throughput, and writes generated ids to `out_file`. steps<=0
  * uses the built-in default. */
 void getp(Transformer *t, const char *req_file, const char *out_file, int steps);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* MLA_GETP_H */
