@@ -1,7 +1,7 @@
-/* Frozen engine entry points the candidate driver (src/getp_run.c) may call.
+/* Frozen engine entry points the candidate driver (src/getp_run.hip) may call.
  * These are the oracle-validated CPU reference kernels defined in src/run.c.
  * A candidate porting to GPU starts by calling them (correct-by-construction),
- * then replaces them incrementally with their own kernels inside getp_run.c. */
+ * then replaces them incrementally with their own kernels inside getp_run.hip. */
 #ifndef MLA_ENGINE_H
 #define MLA_ENGINE_H
 

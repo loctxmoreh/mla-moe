@@ -3,8 +3,8 @@
  * `getp()` (frozen, src/getp_eval.c) reads a fixed request set, brackets the
  * candidate's inference() with a wall clock, and prints one end-to-end number:
  *   achieved throughput TPS (tok/s)
- * The candidate implements the three functions below in src/getp_run.c (the
- * ONLY file they may modify). */
+ * The candidate implements the three functions below in src/getp_run.hip (the
+ * file they modify). */
 #ifndef MLA_GETP_H
 #define MLA_GETP_H
 
@@ -24,7 +24,7 @@ typedef struct {
     int   *out_lens;      /* [num_reqs] number of ids written per request */
 } Requests;
 
-/* Implemented by the candidate in src/getp_run.c: */
+/* Implemented by the candidate in src/getp_run.hip: */
 void      warm_up(Transformer *t);                    /* allocate / upload weights / … */
 void      finish(Transformer *t);                     /* free / tear down */
 long long inference(Transformer *t, Requests *reqs);  /* returns total tokens generated */
