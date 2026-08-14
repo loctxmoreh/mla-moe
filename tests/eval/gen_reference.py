@@ -50,8 +50,10 @@ def parse_args():
     p.add_argument("--max-tokens", type=int, default=_RUN_C_MAX_IDS,
                    help="C-engine buffer cap (full seq)")
     args = p.parse_args()
-    # src/run.c reads at most 4096 ids, and tests/eval/eval.py refuses a dataset
-    # that exceeds it. A larger value here would freeze a set no run can grade.
+    # src/run.c reads at most _RUN_C_MAX_IDS ids. tests/eval/eval.py refuses a
+    # dataset above min(that limit, the model's KV cache), so this bound is the
+    # looser of the two -- a set inside it can still be refused by a model with a
+    # smaller max_position_embeddings.
     if not 2 <= args.max_tokens <= _RUN_C_MAX_IDS:
         p.error(f"--max-tokens must be in [2, {_RUN_C_MAX_IDS}] "
                 f"({_RUN_C_MAX_IDS} is the read limit in src/run.c; "

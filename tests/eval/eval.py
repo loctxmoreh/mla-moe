@@ -204,14 +204,27 @@ def _ppl(nll, ntok):
 _MAX_SEQ = 4096
 
 
+_KV_CACHE_CAP = 163840     # src/model_load.c KV_CACHE_CAP
+
+
 def _kv_capacity(model_dir):
     """max_seq_len as src/model_load.c computes it: min(max_position_embeddings,
-    KV_CACHE_CAP). Falls back to _MAX_SEQ when the config cannot be read."""
+    KV_CACHE_CAP). Falls back to _MAX_SEQ when the config cannot be read.
+
+    cfg_int() takes the default unless the value is a JSON number, so a numeric
+    *string* must not be accepted here either -- int("2048") would make the two
+    disagree. A value below 2 is not a cache length and takes the fallback too.
+    """
     try:
-        cfg = json.load(open(os.path.join(model_dir, "config.json")))
+        with open(os.path.join(model_dir, "config.json")) as f:
+            cfg = json.load(f)
         if not isinstance(cfg, dict):
             return _MAX_SEQ
-        return min(int(cfg.get("max_position_embeddings", 163840)), 163840)
+        maxpos = cfg.get("max_position_embeddings", _KV_CACHE_CAP)
+        if isinstance(maxpos, bool) or not isinstance(maxpos, (int, float)):
+            return _MAX_SEQ              # cfg_int() would take the default
+        maxpos = int(maxpos)
+        return min(maxpos, _KV_CACHE_CAP) if maxpos >= 2 else _MAX_SEQ
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         return _MAX_SEQ
 
@@ -487,9 +500,11 @@ def main():
                     if len(p) + len(c) > cap]
         if too_long:
             print_warnings()
+            src = ("src/run.c's id-read limit" if cap == _MAX_SEQ
+                   else f"the KV cache sized from {model_dir}/config.json")
             print(f"{data}: request(s) {too_long[:8]} exceed the {cap}-token limit "
-                  f"of src/run.c -- regenerate the dataset with a smaller "
-                  f"--max-tokens", file=sys.stderr)
+                  f"({src}) -- regenerate the dataset with a smaller --max-tokens",
+                  file=sys.stderr)
             sys.exit(2)                  # a harness limit, not a gate failure
 
         # path A reads the ppl pair
@@ -574,7 +589,7 @@ def main():
           + (f"  meteor>={thr['meteor']}  bertscore_f1>={thr['bertscore_f1']}" if args.fuzzy else ""),
           flush=True)
 
-    tot = {"P_ok": 0, "D_ok": 0, "cmp": 0, "P_cmp": 0}   # top-1 aggregates
+    tot = {"P_ok": 0, "D_ok": 0, "cmp": 0}          # top-1 aggregates
     worst_ppl = 0.0
     all_misses = []
     nonfinite, mismatched = [], []
@@ -625,10 +640,10 @@ def main():
         worst_ppl = max(worst_ppl, rel)
         # Both are 4-tuples here: the None case exited above.
         tot["D_ok"] += round(sd[0] * sd[2]); tot["cmp"] += sd[2]
-        tot["P_ok"] += round(sp[0] * sp[2]); tot["P_cmp"] += sp[2]
+        tot["P_ok"] += round(sp[0] * sp[2])
         all_misses += [(i, "D", *m) for m in sd[3]]
         all_misses += [(i, "P", *m) for m in sp[3]]
-        print(f"  [{i}] comp={sd[2] if sd else 0:4d}  "
+        print(f"  [{i}] comp={sd[2]:4d}  "
               f"P_top1={sp[0]*100:6.2f}% (tie {sp[1]*100:6.2f}%)  "
               f"D_top1={sd[0]*100:6.2f}% (tie {sd[1]*100:6.2f}%)  "
               f"ppl C={c_ppl:.4f} HF={hf_ppl:.4f} rel={rel:.2e}", flush=True)
