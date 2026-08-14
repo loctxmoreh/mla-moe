@@ -45,7 +45,12 @@ def parse_args():
     p.add_argument("-o", "--out", default=None, help="output dir (default <model>/)")
     p.add_argument("--max-new", type=int, default=64, help="tokens to greedy-generate per prompt")
     p.add_argument("--max-tokens", type=int, default=4096, help="C-engine buffer cap (full seq)")
-    return p.parse_args()
+    args = p.parse_args()
+    # src/run.c reads at most 4096 ids, and tests/eval/eval.py refuses a dataset
+    # that exceeds it. A larger value here would freeze a set no run can grade.
+    if args.max_tokens > 4096:
+        p.error("--max-tokens above 4096 exceeds the read limit in src/run.c")
+    return args
 
 
 def read_requests(path):

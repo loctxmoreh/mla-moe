@@ -441,8 +441,9 @@ def main():
                 and v == v and -math.inf < v < math.inf)
 
     def _count(v):                        # a token count: whole number in [1, 1e9]
-        # Upper bound is not cosmetic: an unbounded int would overflow the
-        # ratio test below, which converts to float.
+        # The upper bound is load-bearing, and not for the reason it once was:
+        # the magnitude test below multiplies (_EXP_MAX * hf_ntok), and that
+        # conversion raises OverflowError on an unbounded int. Do not drop it.
         return (_num(v) and (isinstance(v, int) or v.is_integer())
                 and 1 <= v <= 10**9)
 
@@ -460,7 +461,11 @@ def main():
         sys.exit(2)
     check_dataset_model(args, ref, data)
 
-    if args.tokens is None:
+
+    if args.tokens is None:              # path A: the only path that drives run.c
+        # src/run.c reads at most _MAX_SEQ ids, so a longer sequence is truncated
+        # there and the ppl token counts then disagree. Both lengths are known
+        # before the engine runs, so this costs no timed pass.
         too_long = [i for i, (p, c) in enumerate(zip(prompts, comps))
                     if len(p) + len(c) > _MAX_SEQ]
         if too_long:
@@ -470,7 +475,7 @@ def main():
                   f"--max-tokens", file=sys.stderr)
             sys.exit(2)                  # a harness limit, not a gate failure
 
-    if args.tokens is None:              # path A reads the ppl pair
+        # path A reads the ppl pair
         # hf_nll is a sum of negative log-likelihoods (>= 0); hf_ntok is a token
         # count. NaN/Infinity parse fine from JSON and would survive to make the
         # ppl aggregate silently meaningless, so _num rejects them.
@@ -485,12 +490,23 @@ def main():
                   f"(whole, >= 1) pair",
                   file=sys.stderr)
             sys.exit(2)
-        if args.fuzzy and not args.max_new:      # run_fuzzy reads completion_len
-            bad = [i for i, r in enumerate(recs) if not _usable_len(r)]
-            if bad:
+        if args.fuzzy:
+            if not args.max_new:                 # run_fuzzy reads completion_len
+                bad = [i for i, r in enumerate(recs) if not _usable_len(r)]
+                if bad:
+                    print_warnings()
+                    print(f"{data}/reference.json: record(s) {bad[:8]} have no usable "
+                          f"'completion_len' -- pass --max-new", file=sys.stderr)
+                    sys.exit(2)
+            # `gen` mode in src/run.c raises pos once per step and tests nothing,
+            # so an oversized length writes past the end of the KV cache. bench
+            # mode has this test; gen mode does not.
+            over = [i for i, (p, r) in enumerate(zip(prompts, recs))
+                    if len(p) + (args.max_new or int(r["completion_len"])) > _MAX_SEQ]
+            if over:
                 print_warnings()
-                print(f"{data}/reference.json: record(s) {bad[:8]} have no usable "
-                      f"'completion_len' -- pass --max-new", file=sys.stderr)
+                print(f"prompt + generation exceeds the {_MAX_SEQ}-token buffer for "
+                      f"request(s) {over[:8]} -- lower --max-new", file=sys.stderr)
                 sys.exit(2)
     missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
                            "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
@@ -531,8 +547,8 @@ def main():
               f"-- build with `make run`", file=sys.stderr)
         sys.exit(3)                      # environment fault, not a gate failure
     print(f"[{args.model}] {model_dir}  ({n} requests)  tie={args.tie:.1e}", flush=True)
-    print(f"  gates: top1_strict>={thr['top1_strict']}  ppl_rel<={thr['ppl_rel']}"
-          f"  ppl_ntok must match the reference"
+    print(f"  gates: top1_strict>={thr['top1_strict']} (both paths)  "
+          f"ppl_rel<={thr['ppl_rel']}  ppl_ntok must match the reference"
           + (f"  meteor>={thr['meteor']}  bertscore_f1>={thr['bertscore_f1']}" if args.fuzzy else ""),
           flush=True)
 
@@ -609,8 +625,10 @@ def main():
             print(f"    req{req} pos{pos}: gold {gold} != argmax {am}  gap={gap:.4f}"
                   + ("  [tie]" if gap <= args.tie else ""))
 
-    ok = (d_strict >= thr["top1_strict"] and worst_ppl <= thr["ppl_rel"]
-          and not mismatched)
+    # Both paths gate: a prefill number printed beside RESULT: ok while reaching
+    # no condition is the same asymmetry as a condition the gate line omits.
+    ok = (d_strict >= thr["top1_strict"] and p_strict >= thr["top1_strict"]
+          and worst_ppl <= thr["ppl_rel"] and not mismatched)
 
     if args.fuzzy:
         ok = run_fuzzy(args, model_dir, prompts, comps, recs, thr) and ok
