@@ -16,10 +16,10 @@ A. DEFAULT -- drives the C `run` binary through its single-sequence eval modes:
   Both engine paths are scored: 'P' (prefill/unabsorbed) and 'D' (decode/absorbed),
   and BOTH gate on top1_strict. Measured on the frozen CPU build (2026-08-14,
   dsv2lite, full 5-request dev set): decode 100.000% (160/160), prefill 100.000%
-  (160/160 -- both paths report the same NUMBER of scored rows, enforced per
-  request; the position values themselves are not compared), worst ppl rel-err
-  2.695e-05. Same run on glm47: decode 100.000% (160/160), prefill 100.000%
-  (160/160), worst ppl rel-err 3.030e-05, ppl token-count mismatch 0/5.
+  (160/160), worst ppl rel-err 2.695e-05. Same on glm47: decode 100.000%
+  (160/160), prefill 100.000% (160/160), worst ppl rel-err 3.030e-05, ppl
+  token-count mismatch 0/5. "160/160" is the NUMBER of scored rows, equal on
+  both paths and enforced per request; the position values are not compared.
   worst ppl rel-err 2.695e-05. The 0.99 threshold was calibrated against the
   decode kernel; that run is the evidence for applying it to the prefill kernel
   too, which uses a different forward and accumulates different rounding.
@@ -237,8 +237,10 @@ _RUN_C_MAX_IDS = _read_const("gen_reference.py", "_RUN_C_MAX_IDS", 4096)
 def _kv_capacity(model_dir):
     """-> (cap, shown). cap is max_seq_len as src/model_load.c computes it:
     min(max_position_embeddings, KV_CACHE_CAP). cap <= 0 means the engine cannot
-    load the model; `shown` is the raw config value, so the caller can quote what
-    the file actually holds rather than a sentinel.
+    load the model; `shown` is the config value AS WRITTEN IN THE FILE, so the
+    caller can quote what an operator will actually find there -- and can tell
+    the literal `Infinity` (which cJSON rejects) from `1e400` (valid JSON that
+    cJSON parses to inf), which the parsed value cannot.
 
     cfg_int() takes the default unless the value is a JSON number, so a numeric
     *string* must not be accepted here either -- int("2048") would make the two
@@ -248,9 +250,15 @@ def _kv_capacity(model_dir):
     """
     try:
         with open(os.path.join(model_dir, "config.json")) as f:
-            cfg = json.load(f)
+            text = f.read()
+        cfg = json.loads(text)
         if not isinstance(cfg, dict):
             return _MAX_SEQ, None
+        # The parsed value cannot distinguish the literal token `Infinity` (which
+        # cJSON rejects outright) from `1e400` (valid JSON that cJSON parses to
+        # inf), and both arrive here as Python inf. Keep the source token.
+        m = re.search(r'"max_position_embeddings"\s*:\s*([^,}\s]+)', text)
+        raw = m.group(1) if m else None
         maxpos = cfg.get("max_position_embeddings", _KV_CACHE_CAP)
         if isinstance(maxpos, bool) or not isinstance(maxpos, (int, float)):
             return _MAX_SEQ, None            # cfg_int() would take the default
@@ -260,9 +268,10 @@ def _kv_capacity(model_dir):
             # and max_seq_len is whatever that cast produced -- which is not 0,
             # and is not something to guess at. (NaN/Infinity are not valid JSON
             # either: cJSON_Parse fails and model_load.c exits before the cache
-            # is allocated.) Report it as unusable and name the cast.
-            return 0, maxpos
-        return min(int(maxpos), _KV_CACHE_CAP), maxpos
+            # is allocated.) cap None means "unrepresentable", which 0 cannot
+            # signal -- 0 is itself a legal (and unloadable) cache length.
+            return None, raw
+        return min(int(maxpos), _KV_CACHE_CAP), raw
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         return _MAX_SEQ, None
 
@@ -534,8 +543,8 @@ def main():
         # disagree), and teacher/ppl both hand the whole sequence to
         # forward_unabsorbed, which writes kv_l[p * KVD] for every position.
         kv_cap, kv_shown = _kv_capacity(model_dir)
-        cap = min(_MAX_SEQ, kv_cap)
-        if cap < 1:
+        cap = _MAX_SEQ if kv_cap is None else min(_MAX_SEQ, kv_cap)
+        if kv_cap is None or kv_cap < 1:
             # Only a non-positive length is unloadable. A length of 0 makes
             # calloc return a zero-size block, and every layer then writes past
             # it. A negative length converts to a huge size_t at
@@ -544,15 +553,14 @@ def main():
             # runs a one-token sequence, so that case belongs to the too_long
             # test below, which names the dataset instead.
             print_warnings()
-            if kv_shown is not None and kv_shown != kv_shown:
-                why = ("holds max_position_embeddings NaN, which is not valid "
-                       "JSON: cJSON_Parse fails and src/model_load.c exits at "
-                       "the parse")
-            elif kv_shown is not None and abs(kv_shown) == math.inf:
+            # NaN/Infinity are literals JSON does not define: cJSON rejects the
+            # file. 1e400 is valid JSON that cJSON parses to inf, so the cast is
+            # what loses it. Only the source token separates the two.
+            if kv_shown in ("NaN", "Infinity", "-Infinity"):
                 why = (f"holds max_position_embeddings {kv_shown}, which is not "
                        f"valid JSON: cJSON_Parse fails and src/model_load.c exits "
                        f"at the parse")
-            elif kv_shown is not None and not (-2**31 <= kv_shown < 2**31):
+            elif kv_cap is None and kv_shown is not None:
                 why = (f"holds a max_position_embeddings ({kv_shown}) that "
                        f"src/model_load.c cannot represent (cfg_int casts it to "
                        f"a C int)")
@@ -593,10 +601,11 @@ def main():
                        f"longest prompt is {longest} tokens, so only a 1-token "
                        f"completion fits under {cap})")
             elif cap >= longest:
-                # The prompt fits; the blocker is gen_reference.py's own rule that
-                # every prompt keeps 2 free positions, and (when `need` is over
-                # the generator's ceiling) that ceiling. Naming the engine limits
-                # here would send the operator to the wrong knob.
+                # The prompt fits; what does not is the 2 free positions
+                # gen_reference.py keeps above every prompt -- and when `need` is
+                # over the generator's ceiling, that ceiling too. The engine limit
+                # is still worth naming as the second remedy, since raising it
+                # also raises the ceiling the generator checks against.
                 blocker = ("gen_reference.py needs 2 free positions above it, and "
                            f"its --max-tokens ceiling is {_RUN_C_MAX_IDS}"
                            if need > _RUN_C_MAX_IDS else
