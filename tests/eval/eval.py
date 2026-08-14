@@ -27,9 +27,8 @@ B. --tokens FILE -- scores a generated-token-ids file (one line of space-separat
   agreement (tokens before the first divergence from the golden continuation) is
   printed alongside as a DIAGNOSTIC and does not affect the verdict -- an engine
   using bf16/fp8 weights or a bf16 KV cache legitimately diverges from the fp32
-  reference, so sameness cannot gate. Read the prefix numbers to tell a
-  numerically-different engine from a broken one, and see score_nll.py for the
-  measurement that actually separates those two cases.
+  reference, so sameness cannot gate. Read the prefix numbers anyway: agreement
+  that collapses while throughput jumps is the sign that something broke.
 
 Thresholds for both come from threshold.json.
 
