@@ -198,11 +198,16 @@ def check_dataset_model(args, ref, data):
             # A damaged manifest is a misconfiguration like the rest of the
             # dataset reads; it must not surface as a traceback at exit 1.
             try:
-                stated = json.load(open(man)).get("model")
+                man_obj = json.load(open(man))
             except (OSError, ValueError) as e:
                 print_warnings()
                 print(f"cannot read {man} ({type(e).__name__}: {e})", file=sys.stderr)
                 sys.exit(2)
+            if not isinstance(man_obj, dict):
+                print_warnings()
+                print(f"{man} does not hold a JSON object", file=sys.stderr)
+                sys.exit(2)
+            stated = man_obj.get("model")
     if stated and stated != args.model:
         print_warnings()
         print(f"dataset {data} is for model '{stated}', but MODEL={args.model}",
@@ -352,7 +357,7 @@ def score_tokens(args, model_dir, comps, thr):
             # Only n_at_cap requests stop at `cap`; a mixed run can also hold
             # requests that stop exactly at STEPS, and those ARE capped.
             n_at_steps = counts.get(args.steps, 0)
-            warn(f"{n_at_cap}/{len(comps)} of the {len(short)} short requests stop at "
+            warn(f"{n_at_cap} of the {len(short)} short requests stop at "
                  f"{cap}, far below STEPS={args.steps} -- the engine stopped early itself"
                  + (f"; {n_at_steps} other request(s) stop at exactly STEPS="
                     f"{args.steps}, which IS a cap below the reference (max {longest})"
@@ -378,10 +383,13 @@ def main():
         prompts = read_id_lines(os.path.join(data, "prompts.i32.txt"))
         comps = read_id_lines(os.path.join(data, "completions.i32.txt"))
         recs = ref["requests"]
-    except (OSError, ValueError, KeyError) as e:
+    except (OSError, ValueError, KeyError, TypeError) as e:
         print(f"cannot read the dataset or thresholds ({type(e).__name__}: {e})",
               file=sys.stderr)
         sys.exit(2)                      # misconfiguration, not a gate failure
+    if not isinstance(thr, dict):
+        print(f"{args.thresholds} does not hold a JSON object", file=sys.stderr)
+        sys.exit(2)
     missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
                            "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
     if missing:
@@ -417,6 +425,11 @@ def main():
         print("  RESULT:", "ok" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
+    # A bare word goes to PATH in execvp but to the working directory in
+    # os.access, so the guard and the launch would test different files. The
+    # Makefile makes the same correction for RUN.
+    if os.sep not in args.run:
+        args.run = os.path.join(".", args.run)
     if not os.path.exists(args.run) or not os.access(args.run, os.X_OK):
         print_warnings()
         print(f"C run binary not usable: {args.run} "
@@ -439,6 +452,12 @@ def main():
         rows = parse_teacher(out, plen)
         sp = score_rows(rows["P"], plen, args.tie)
         sd = score_rows(rows["D"], plen, args.tie)
+        if sp is None or sd is None:
+            print_warnings()
+            print(f"{args.run} printed no teacher row for the completion region of "
+                  f"request {i} (mode teacher {plen}) -- wrong binary or a build "
+                  f"without the eval modes", file=sys.stderr)
+            sys.exit(3)                  # environment fault, not a gate failure
         # --- Tier 2: perplexity rel-err vs frozen HF nll ---
         c_nll, c_ntok = parse_ppl(run_c(args.run, model_dir, full, "ppl"))
         if c_nll is None or not c_ntok:

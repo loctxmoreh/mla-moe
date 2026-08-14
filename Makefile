@@ -77,11 +77,16 @@ GETP_DEPS = $(if $(filter run ./run $(CURDIR)/run,$(RUN))$(filter $(realpath ./r
 # The steps count has ONE definition, read from the C harness so the two cannot
 # drift: it is passed to the binary and to eval.py --steps. The path is anchored
 # to THIS makefile's directory, not $(CURDIR) -- make sets CURDIR to the working
-# directory, so `make -f <repo>/Makefile` from elsewhere would not find the file.
+# directory. That anchor covers THIS READ ONLY: DATA and the scorer path stay
+# relative to the working directory, so run make from the repo root.
+# Known limit: make variables are space-separated lists, so $(firstword
+# $(MAKEFILE_LIST)) truncates if this file's own path contains a space, and the
+# read then yields nothing. Quoting cannot fix that. The guard below turns it
+# into a clean stop, so no timed run ever gets a wrong count.
 # The recipes assert the result is a usable integer before spending a timed run.
 GETP_MK_DIR = $(dir $(firstword $(MAKEFILE_LIST)))
 GETP_DEFAULT_STEPS = $(shell sed -n 's/^\#define GETP_DEFAULT_STEPS *\([0-9]*\).*/\1/p' \
-                       $(GETP_MK_DIR)src/getp_eval.c)
+                       "$(GETP_MK_DIR)src/getp_eval.c")
 GETP_STEPS = $(if $(STEPS),$(STEPS),$(GETP_DEFAULT_STEPS))
 
 # DATA selects the dataset dir. Defaults to the small in-repo dev set; point it at
