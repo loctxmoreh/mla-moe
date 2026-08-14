@@ -254,10 +254,15 @@ a gate failure from an environment fault. A grading script should run the timed
 batch with `make` and then call the scorer directly:
 
 ```sh
-make getp MODEL=dsv2lite MODELDIR="$DSV" DATA="$DATA"        # timed run, writes the ids
+OUT="$PWD/getp_ids.txt"; STEPS=128        # one value each, used by both commands
+make getp MODEL=dsv2lite MODELDIR="$DSV" DATA="$DATA" OUT="$OUT" STEPS="$STEPS"
 uv run --extra fuzzy python tests/eval/eval.py dsv2lite \
-  -d "$DATA" --tokens "$OUT" --model-dir "$DSV" --steps 128  # exit code below
+  -d "$DATA" --tokens "$OUT" --model-dir "$DSV" --steps "$STEPS"   # exit code below
 ```
+
+Set `OUT` and `STEPS` explicitly rather than letting them default: `make` derives the
+ids path from `MODEL` and `DATA` and never prints it, and the scorer needs the same
+`STEPS` the run used or its cap check reads a value that did not happen.
 
 **0** ok · **1** the gate failed · **2** not graded (nothing was scored — `--quick`, a
 misconfiguration, or a generation capped below the reference length) · **3**

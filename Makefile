@@ -54,6 +54,26 @@ MODEL ?= dsv2lite
 eval-gen: run
 	uv run python tests/eval/gen_reference.py $(MODEL)
 
+# RUN points at the engine binary, so a grader can score a submitted or
+# alternately-built binary (RUN=./run-ref, RUN=./submission) with any target
+# below. Building the working tree is only a prerequisite when RUN is that build:
+# a submitted binary must be gradeable on a tree that does not compile.
+# This block must stay ABOVE every target that uses GETP_DEPS -- make expands
+# prerequisites when it reads the rule, so a reference from higher up is empty.
+RUN      ?= ./run
+# `test -x run` passes (the shell resolves it against cwd) but `run ...` as a
+# command searches PATH, which does not hold cwd -- exit 127 at run time, which
+# `make -n` cannot show. Make the path explicit for every bare-word spelling.
+RUN_BIN   = $(if $(findstring /,$(RUN)),$(RUN),./$(RUN))
+# Match by name AND by resolved path, so `run`, `./run`, `$(CURDIR)/run` and any
+# symlinked alias of the same file all rebuild. realpath is empty before the first
+# build, which is why the textual filter stays as the fallback.
+GETP_DEPS = $(if $(filter run ./run $(CURDIR)/run,$(RUN))$(filter $(realpath ./run),$(realpath $(RUN))),run,)
+# The steps count has ONE definition, read from the C harness so the two cannot
+# drift: it is passed to the binary and to eval.py --steps.
+GETP_DEFAULT_STEPS = $(shell sed -n 's/^\#define GETP_DEFAULT_STEPS *\([0-9]*\).*/\1/p' src/getp_eval.c)
+GETP_STEPS = $(if $(STEPS),$(STEPS),$(GETP_DEFAULT_STEPS))
+
 # DATA selects the dataset dir. Defaults to the small in-repo dev set; point it at
 # a fetched public/private set (see eval-fetch) to grade on the real request mix.
 DATA ?= tests/eval/$(MODEL)
@@ -89,7 +109,7 @@ eval-warm:
 # paths) + perplexity rel-err. Add FUZZY=1 for the METEOR/BERTScore free-run tier.
 # MODELDIR is needed when the dataset's reference.json records a Hub repo id
 # rather than a local path (the public set does).
-eval: run
+eval: $(GETP_DEPS)
 	uv run $(if $(FUZZY),--extra fuzzy,) python tests/eval/eval.py $(MODEL) -d "$(DATA)" \
 	  $(if $(RUN),-r "$(RUN_BIN)",) \
 	  $(if $(MODELDIR),--model-dir "$(MODELDIR)",) $(if $(FUZZY),--fuzzy,)
@@ -97,7 +117,7 @@ eval: run
 # --- performance benchmark ------------------------------------------------
 # Device-agnostic prefill/decode perf. Point -r/RUN at any engine build (CPU,
 # run-ref, or a future GPU binary). Override PREFILL/DECODE/REPS/OUT as needed.
-bench: run
+bench: $(GETP_DEPS)
 	uv run python tests/bench/bench.py $(MODEL) \
 	  $(if $(RUN),-r "$(RUN_BIN)",) $(if $(PREFILL),--prefill "$(PREFILL)",) \
 	  $(if $(DECODE),--decode "$(DECODE)",) $(if $(REPS),--reps "$(REPS)",) \
@@ -112,20 +132,6 @@ MODELDIR ?= $(if $(filter glm47,$(MODEL)),$(GLM),$(DSV))
 # a shared machine gives EACCES on another user's file, and two runs of one user
 # would otherwise overwrite the ids that getp-eval then grades.
 GETP_OUT  = $(if $(OUT),$(OUT),$(CURDIR)/getp_$(MODEL)_$(subst /,_,$(DATA)).txt)
-# RUN points at the engine binary, so a grader can score a submitted or
-# alternately-built binary (RUN=./run-ref, RUN=./submission) with these targets.
-# Building the working tree is only a prerequisite when RUN is that build: a
-# submitted binary must be gradeable on a tree that does not compile.
-RUN      ?= ./run
-# `test -x run` passes (the shell resolves it against cwd) but `run ...` as a
-# command searches PATH, which does not hold cwd -- exit 127 at run time, which
-# `make -n` cannot show. Make the path explicit for every bare-word spelling.
-RUN_BIN   = $(if $(findstring /,$(RUN)),$(RUN),./$(RUN))
-GETP_STEPS = $(if $(STEPS),$(STEPS),128)
-# Match by name AND by resolved path, so `run`, `./run`, `$(CURDIR)/run` and any
-# symlinked alias of the same file all rebuild. realpath is empty before the first
-# build, which is why the textual filter stays as the fallback.
-GETP_DEPS = $(if $(filter run ./run $(CURDIR)/run,$(RUN))$(filter $(realpath ./run),$(realpath $(RUN))),run,)
 getp: $(GETP_DEPS)
 	@test -n "$(RUN)" -a -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }

@@ -209,14 +209,14 @@ def score_tokens(args, model_dir, comps, thr):
     # and dropping it would misreport the failure as a line-count mismatch.
     try:
         raw = open(args.tokens).read().split("\n")
-    except OSError as e:
+        if raw and raw[-1] == "":
+            raw.pop()
+        gen = [[int(x) for x in ln.split()] for ln in raw]
+    except (OSError, ValueError) as e:
         print_warnings()
-        print(f"cannot read {args.tokens}: {e}", file=sys.stderr)
+        print(f"cannot read {args.tokens} ({type(e).__name__}: {e})", file=sys.stderr)
         sys.exit(2)                      # misconfiguration, not a gate failure
     
-    if raw and raw[-1] == "":
-        raw.pop()
-    gen = [[int(x) for x in ln.split()] for ln in raw]
     if len(gen) != len(comps):
         print_warnings()
         print(f"{args.tokens}: {len(gen)} lines != {len(comps)} requests in the dataset",
@@ -252,7 +252,8 @@ def score_tokens(args, model_dir, comps, thr):
           f"advisory floor {thr['getp_prefix']*100:.0f}%]")
     print(f"  worst request             = {min(fracs)*100:.3f}%        [diagnostic]")
     print(f"  below {thr['getp_min_prefix']*100:.0f}% floor           = {len(bad)}/{len(fracs)}"
-          f" ({len(bad)/len(fracs)*100:.2f}%)        [diagnostic]"
+          f" ({len(bad)/len(fracs)*100:.2f}%)        [diagnostic, advisory max "
+          f"{thr.get('getp_bad_frac', 0.05)*100:.0f}%]"
           + (f"  reqs {bad[:8]}{'...' if len(bad) > 8 else ''}" if bad else ""))
 
     # Truncating over-long generations is free, but a generation SHORTER than the
@@ -288,7 +289,12 @@ def score_tokens(args, model_dir, comps, thr):
         # generation: the engine truncated on its own, which is a real defect and
         # must reach the gate rather than be excused as a misconfiguration.
         capped = (args.steps or 0) < longest
-        if capped and cap > 0 and n_at_cap >= max(2, thr["getp_bad_frac"] * len(comps)) \
+        # A STEPS cap stops generation AT the requested count, so a stop far below
+        # it is the engine truncating itself. One token of tolerance keeps an
+        # off-by-one engine loop inside the check.
+        explained = cap >= args.steps - 1 if args.steps else True
+        if capped and explained and cap > 0 \
+                and n_at_cap >= max(2, thr.get("getp_cap_quorum", 0.05) * len(comps)) \
                 and cap < longest:
             print_warnings()
             # exit 2 = "not graded", same as --quick; 1 is reserved for a real FAIL
@@ -317,12 +323,22 @@ def main():
     import math
     args = parse_args()
     data = args.dir or os.path.join(_HERE, args.model)
-    ref = json.load(open(os.path.join(data, "reference.json")))
+    try:
+        ref = json.load(open(os.path.join(data, "reference.json")))
+        thr = json.load(open(args.thresholds))
+        prompts = read_id_lines(os.path.join(data, "prompts.i32.txt"))
+        comps = read_id_lines(os.path.join(data, "completions.i32.txt"))
+        recs = ref["requests"]
+    except (OSError, ValueError, KeyError) as e:
+        print(f"cannot read the dataset or thresholds ({type(e).__name__}: {e})",
+              file=sys.stderr)
+        sys.exit(2)                      # misconfiguration, not a gate failure
+    missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix") if k not in thr]
+    if missing:
+        print(f"{args.thresholds} is missing required key(s): {', '.join(missing)}",
+              file=sys.stderr)
+        sys.exit(2)
     model_dir = args.model_dir or ref["model_dir"]
-    thr = json.load(open(args.thresholds))
-    prompts = read_id_lines(os.path.join(data, "prompts.i32.txt"))
-    comps = read_id_lines(os.path.join(data, "completions.i32.txt"))
-    recs = ref["requests"]
     n = len(recs)
     # Not an assert: `python -O` would drop it and zip() would then hide the
     # difference silently. A malformed dataset is a misconfiguration, not a FAIL.
@@ -332,7 +348,11 @@ def main():
         sys.exit(2)
     check_dataset_model(args, ref, data)
 
-    if args.tokens:
+    if args.tokens is not None:
+        if not args.tokens:
+            print("--tokens needs a path; an empty value scores nothing",
+                  file=sys.stderr)
+            sys.exit(2)
         print(f"[{args.model}] {args.tokens}  ({n} requests)", flush=True)
         ok = score_tokens(args, model_dir, comps, thr)
         print()
