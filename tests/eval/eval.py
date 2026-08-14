@@ -15,7 +15,8 @@ A. DEFAULT -- drives the C `run` binary through its single-sequence eval modes:
   positions measure natural-language unpredictability, not engine correctness.
   Both engine paths are scored: 'P' (prefill/unabsorbed) and 'D' (decode/absorbed),
   and BOTH gate on top1_strict. Measured on the frozen CPU build (2026-08-14,
-  dsv2lite, full 5-request dev set): decode 100.000% (160/160), prefill 100.000%,
+  dsv2lite, full 5-request dev set): decode 100.000% (160/160), prefill 100.000%
+  (160/160 -- the two paths score the same positions, enforced per request),
   worst ppl rel-err 2.695e-05. The 0.99 threshold was calibrated against the
   decode kernel; that run is the evidence for applying it to the prefill kernel
   too, which uses a different forward and accumulates different rounding.
@@ -232,12 +233,13 @@ def _kv_capacity(model_dir):
         maxpos = cfg.get("max_position_embeddings", _KV_CACHE_CAP)
         if isinstance(maxpos, bool) or not isinstance(maxpos, (int, float)):
             return _MAX_SEQ, None            # cfg_int() would take the default
-        if isinstance(maxpos, float) and not math.isfinite(maxpos):
-            return 0, maxpos                 # json gives inf for 1e400; C casts it
-        if not -2**31 <= int(maxpos) < 2**31:
+        if (isinstance(maxpos, float) and not math.isfinite(maxpos)) \
+                or not -2**31 <= int(maxpos) < 2**31:
             # cfg_int casts cJSON's valuedouble to a C int, so the value is lost
-            # and max_seq_len is whatever the cast produced. Report it as
-            # unloadable rather than guess.
+            # and max_seq_len is whatever that cast produced -- which is not 0,
+            # and is not something to guess at. (NaN/Infinity are not valid JSON
+            # either: cJSON_Parse fails and model_load.c exits before the cache
+            # is allocated.) Report it as unusable and name the cast.
             return 0, maxpos
         return min(int(maxpos), _KV_CACHE_CAP), maxpos
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
@@ -521,10 +523,15 @@ def main():
             # runs a one-token sequence, so that case belongs to the too_long
             # test below, which names the dataset instead.
             print_warnings()
-            held = ("" if kv_shown is None
-                    else f" (max_position_embeddings = {kv_shown!r})")
-            print(f"{model_dir}/config.json{held} gives a KV cache length of "
-                  f"{kv_cap}: the engine cannot load this model", file=sys.stderr)
+            if kv_shown is not None and not (-2**31 <= kv_shown < 2**31):
+                why = (f"holds a max_position_embeddings that src/model_load.c "
+                       f"cannot represent (cfg_int casts it to a C int)")
+            else:
+                why = (f"gives a KV cache length of {kv_cap}"
+                       + ("" if kv_shown is None
+                          else f" (max_position_embeddings = {kv_shown})"))
+            print(f"{model_dir}/config.json {why}: the engine cannot load this "
+                  f"model", file=sys.stderr)
             sys.exit(3)                  # environment fault, not a gate failure
         too_long = [i for i, (p, c) in enumerate(zip(prompts, comps))
                     if len(p) + len(c) > cap]
@@ -544,12 +551,19 @@ def main():
                       "max_position_embeddings (both bind)" if tie else
                       "raise src/run.c's read limit" if cap == _MAX_SEQ
                       else "use a model with a larger max_position_embeddings")
-            fix = ("regenerate the dataset with a smaller --max-tokens"
-                   if cap >= need else
-                   f"no --max-tokens value helps: the longest prompt needs {need} "
-                   f"tokens to regenerate -- regenerate with --max-tokens and "
-                   f"--max-new small enough that prompt+completion fits, or "
-                   f"{raise_}, or shorten the prompts")
+            longest = need - 2               # the longest prompt itself
+            if cap >= need:
+                fix = "regenerate the dataset with a smaller --max-tokens"
+            elif cap >= longest + 1:
+                # A 1-token completion still fits, but gen_reference needs two
+                # free positions, so --max-tokens alone cannot do it.
+                fix = (f"regenerate with --max-tokens {need} --max-new 1 (the "
+                       f"longest prompt is {longest} tokens, so only a 1-token "
+                       f"completion fits under {cap})")
+            else:
+                fix = (f"no flags help: the longest prompt is {longest} tokens and "
+                       f"does not fit under {cap} on its own -- {raise_}, or "
+                       f"shorten the prompts")
             print(f"{data}: request(s) {too_long[:8]} exceed the {cap}-token limit "
                   f"({src}) -- {fix}", file=sys.stderr)
             sys.exit(2)                  # a harness limit, not a gate failure
