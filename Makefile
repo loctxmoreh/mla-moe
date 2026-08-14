@@ -92,14 +92,14 @@ DATA ?= tests/eval/$(MODEL)
 PUBLIC_SET ?= thanhnx12/mla-moe-dataset-public
 FETCH_DIR   = tests/eval/fetched/$(notdir $(PUBLIC_SET))
 eval-fetch:
-	@for m in dsv2lite glm47; do mkdir -p $(FETCH_DIR)/$$m; \
+	@for m in dsv2lite glm47; do mkdir -p "$(FETCH_DIR)/$$m"; \
 	  for f in requests.txt prompts.i32.txt completions.i32.txt reference.json manifest.json; do \
-	    curl -sSLf -o $(FETCH_DIR)/$$m/$$f \
+	    curl -sSLf -o "$(FETCH_DIR)/$$m/$$f" \
 	      "https://huggingface.co/datasets/$(PUBLIC_SET)/resolve/main/$$m/$$f" \
 	      || { echo "fetch failed: $$m/$$f"; exit 1; }; \
 	  done; done
 	@echo "fetched $(PUBLIC_SET) (split: $$(sed -n 's/.*\"split\": *\"\([^\"]*\)\".*/\1/p' \
-	  $(FETCH_DIR)/dsv2lite/manifest.json)) -> $(FETCH_DIR)/"
+	  "$(FETCH_DIR)/dsv2lite/manifest.json")) -> $(FETCH_DIR)/"
 	@echo "use DATA=$(FETCH_DIR)/<model>"
 
 # Pre-fill the Hub and nltk caches that the accuracy tier needs (metric scripts,

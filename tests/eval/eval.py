@@ -184,7 +184,14 @@ def check_dataset_model(args, ref, data):
     if stated is None:
         man = os.path.join(data, "manifest.json")
         if os.path.exists(man):
-            stated = json.load(open(man)).get("model")
+            # A damaged manifest is a misconfiguration like the rest of the
+            # dataset reads; it must not surface as a traceback at exit 1.
+            try:
+                stated = json.load(open(man)).get("model")
+            except (OSError, ValueError) as e:
+                print_warnings()
+                print(f"cannot read {man} ({type(e).__name__}: {e})", file=sys.stderr)
+                sys.exit(2)
     if stated and stated != args.model:
         print_warnings()
         print(f"dataset {data} is for model '{stated}', but MODEL={args.model}",
