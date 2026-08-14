@@ -30,6 +30,10 @@ B. --tokens FILE -- scores a generated-token-ids file (one line of space-separat
   reference, so sameness cannot gate. Read the prefix numbers anyway: agreement
   that collapses while throughput jumps is the sign that something broke.
 
+  Caveat: the 0.90 raw BERTScore limit gives the gate a partial prefix-agreement
+  effect anyway -- an engine that diverges inside the first half of a completion
+  can fail it. The exam accepts that as a property of the chosen value.
+
 Thresholds for both come from threshold.json.
 
 Exit codes: 0 = ok, 1 = the gate failed, 2 = not graded (nothing was scored),
@@ -110,11 +114,18 @@ def run_c(run_bin, model_dir, ids, *mode):
     try:
         return subprocess.run([run_bin, model_dir, path, *map(str, mode)],
                               capture_output=True, text=True, check=True).stdout
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, OSError) as e:
+        # CalledProcessError is a SubprocessError, not an OSError: a binary that
+        # never starts (no execute bit, a directory) raises the latter and would
+        # otherwise exit 1, which the README calls a candidate failure.
         print_warnings()
-        print(f"engine failed: {run_bin} exited {e.returncode} "
-              f"(mode {' '.join(map(str, mode))}). A wrong model dir is the usual "
-              f"cause.\n{(e.stderr or '').strip()[:400]}", file=sys.stderr)
+        rc = getattr(e, "returncode", None)
+        print(f"engine failed: {run_bin} "
+              + (f"exited {rc}" if rc is not None
+                 else f"could not start ({type(e).__name__}: {e})")
+              + f" (mode {' '.join(map(str, mode))}). A wrong model dir is the usual "
+                f"cause.\n{(getattr(e, 'stderr', '') or '').strip()[:400]}",
+              file=sys.stderr)
         sys.exit(3)                      # environment fault, not a gate failure
     finally:
         os.unlink(path)
@@ -406,10 +417,11 @@ def main():
         print("  RESULT:", "ok" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
-    if not os.path.exists(args.run):
+    if not os.path.exists(args.run) or not os.access(args.run, os.X_OK):
         print_warnings()
-        print(f"C run binary not found: {args.run} (build with `make run`)",
-              file=sys.stderr)
+        print(f"C run binary not usable: {args.run} "
+              f"({'not found' if not os.path.exists(args.run) else 'not executable'}) "
+              f"-- build with `make run`", file=sys.stderr)
         sys.exit(3)                      # environment fault, not a gate failure
     print(f"[{args.model}] {model_dir}  ({n} requests)  tie={args.tie:.1e}", flush=True)
     print(f"  gates: top1_strict>={thr['top1_strict']}  ppl_rel<={thr['ppl_rel']}"

@@ -245,7 +245,10 @@ The **gate** is the accuracy gate: `meteor >= 0.25` and `bertscore_f1 >= 0.90`
 request emits before diverging from the reference continuation — prints alongside as
 a **diagnostic** and does not decide the verdict. It cannot: one flipped argmax
 derails every token after it, so an engine using bf16/fp8 weights or a bf16 KV cache
-diverges from the fp32 reference while still being correct. `QUICK=1` prints the
+diverges from the fp32 reference while still being correct. Note though that the 0.90
+raw BERTScore limit gives the gate a partial prefix-agreement effect anyway: an engine
+that diverges inside the first half of a completion can fail it. The exam accepts that
+as a property of the chosen value. `QUICK=1` prints the
 diagnostics and skips the accuracy tier's heavy deps (it grades nothing, and exits 2).
 
 **Exit codes are `tests/eval/eval.py`'s, not `make`'s.** GNU make reports its own
