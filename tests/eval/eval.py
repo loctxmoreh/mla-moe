@@ -13,7 +13,12 @@ A. DEFAULT -- drives the C `run` binary through its single-sequence eval modes:
 
   Top-1 is scored over the COMPLETION region only (pos >= prompt_len): prompt
   positions measure natural-language unpredictability, not engine correctness.
-  Both engine paths are scored: 'P' (prefill/unabsorbed) and 'D' (decode/absorbed).
+  Both engine paths are scored: 'P' (prefill/unabsorbed) and 'D' (decode/absorbed),
+  and BOTH gate on top1_strict. Measured on the frozen CPU build (2026-08-14,
+  dsv2lite, full 5-request dev set): decode 100.000% (160/160), prefill 100.000%,
+  worst ppl rel-err 2.695e-05. The 0.99 threshold was calibrated against the
+  decode kernel; that run is the evidence for applying it to the prefill kernel
+  too, which uses a different forward and accumulates different rounding.
   A mismatch with logit gap <= --tie is a numerical tie, not an error (tie-tolerant
   column); the strict column gates.
 
