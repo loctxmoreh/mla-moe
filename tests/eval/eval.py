@@ -51,6 +51,7 @@ Options:
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -89,6 +90,8 @@ def parse_args():
     for opt, val in (("--quick", args.quick), ("--steps", args.steps is not None)):
         if val and args.tokens is None:
             p.error(f"{opt} requires --tokens")
+    if args.max_new is not None and args.max_new < 1:
+        p.error("--max-new must be >= 1")
     if args.steps is not None and args.steps < 1:
         # getp_eval.c raises steps<=0 to GETP_DEFAULT_STEPS, so the hint would
         # describe a run that never happened.
@@ -408,29 +411,13 @@ def main():
     # already run, so a malformed record would cost timed passes first -- and the
     # --fuzzy read would discard a complete top-1/ppl result. Only the fields THIS
     # run will actually read are required: --tokens reads neither pair.
-    def _num(v):
-        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    def _num(v):                          # finite real; bool subclasses int
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v))
 
-    if args.tokens is None:              # path A reads the ppl pair
-        bad = [i for i, r in enumerate(recs)
-               if not isinstance(r, dict) or not _num(r.get("hf_nll"))
-               or not _num(r.get("hf_ntok")) or not r.get("hf_ntok")]
-        if bad:
-            print(f"{data}/reference.json: record(s) {bad[:8]} miss a usable "
-                  f"numeric 'hf_nll'/'hf_ntok' pair", file=sys.stderr)
-            sys.exit(2)
-        if args.fuzzy and not args.max_new:      # run_fuzzy reads completion_len
-            bad = [i for i, r in enumerate(recs) if not _usable_len(r)]
-            if bad:
-                print(f"{data}/reference.json: record(s) {bad[:8]} have no usable "
-                      f"'completion_len' -- pass --max-new", file=sys.stderr)
-                sys.exit(2)
-    missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
-                           "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
-    if missing:
-        print(f"{args.thresholds} is missing required key(s): {', '.join(missing)}",
-              file=sys.stderr)
-        sys.exit(2)
+    def _count(v):                        # a token count: whole number >= 1
+        return _num(v) and float(v).is_integer() and v >= 1
+
     if not args.model_dir and "model_dir" not in ref:
         print(f"{data}/reference.json has no 'model_dir': pass --model-dir",
               file=sys.stderr)
@@ -444,6 +431,33 @@ def main():
               f"{len(comps)} completions, {n} reference records", file=sys.stderr)
         sys.exit(2)
     check_dataset_model(args, ref, data)
+
+    if args.tokens is None:              # path A reads the ppl pair
+        # hf_nll is a sum of negative log-likelihoods (>= 0); hf_ntok is a token
+        # count. NaN/Infinity parse fine from JSON and would survive to make the
+        # ppl aggregate silently meaningless, so _num rejects them.
+        bad = [i for i, r in enumerate(recs)
+               if not isinstance(r, dict) or not _num(r.get("hf_nll"))
+               or r["hf_nll"] < 0 or not _count(r.get("hf_ntok"))]
+        if bad:
+            print_warnings()
+            print(f"{data}/reference.json: record(s) {bad[:8]} miss a usable "
+                  f"'hf_nll' (finite, >= 0) / 'hf_ntok' (whole, >= 1) pair",
+                  file=sys.stderr)
+            sys.exit(2)
+        if args.fuzzy and not args.max_new:      # run_fuzzy reads completion_len
+            bad = [i for i, r in enumerate(recs) if not _usable_len(r)]
+            if bad:
+                print_warnings()
+                print(f"{data}/reference.json: record(s) {bad[:8]} have no usable "
+                      f"'completion_len' -- pass --max-new", file=sys.stderr)
+                sys.exit(2)
+    missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
+                           "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
+    if missing:
+        print(f"{args.thresholds} is missing required key(s): {', '.join(missing)}",
+              file=sys.stderr)
+        sys.exit(2)
 
     if args.tokens is not None:
         if not args.tokens:
@@ -507,6 +521,13 @@ def main():
         hf_ppl = math.exp(rec["hf_nll"] / rec["hf_ntok"])
         c_ppl = math.exp(c_nll / c_ntok)
         rel = abs(c_ppl - hf_ppl) / hf_ppl
+        if not math.isfinite(rel):
+            # max() compares with >, and every comparison with NaN is false, so a
+            # NaN would leave the aggregate at 0.0 and pass the gate. The dataset
+            # side is validated above, so this came from the engine.
+            warn(f"request {i}: the engine's perplexity is not a finite number "
+                 f"(nll={c_nll}) -- scoring it as maximally wrong")
+            rel = float("inf")
         worst_ppl = max(worst_ppl, rel)
         if sd:
             tot["D_ok"] += round(sd[0] * sd[2]); tot["cmp"] += sd[2]
