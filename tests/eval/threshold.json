@@ -5,5 +5,5 @@
   "getp_min_prefix": 0.2,
   "getp_bad_frac": 0.05,
   "meteor": 0.25,
-  "bertscore_f1": 0.8
+  "bertscore_f1": 0.9
 }

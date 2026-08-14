@@ -240,7 +240,7 @@ wrote against the golden completions (`<dataset>/completions.i32.txt`), so **you
 `inference()` is graded on its own output** and the scoring is blind to how you
 scheduled the batch.
 
-The **gate** is the accuracy gate: `meteor >= 0.25` and `bertscore_f1 >= 0.80`
+The **gate** is the accuracy gate: `meteor >= 0.25` and `bertscore_f1 >= 0.90`
 (`tests/eval/threshold.json`). Free-run **prefix agreement** — how many tokens each
 request emits before diverging from the reference continuation — prints alongside as
 a **diagnostic** and does not decide the verdict. It cannot: one flipped argmax

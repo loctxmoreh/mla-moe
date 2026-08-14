@@ -156,10 +156,14 @@ def check_dataset_model(args, ref, data):
     if stated and stated != args.model:
         sys.exit(f"dataset {data} is for model '{stated}', but MODEL={args.model}")
 
+    # model_dir is provenance -- the weight-directory name on the machine that
+    # generated the set -- so a rename there must not block a consistent dataset.
+    # Heuristic, therefore a warning; the authoritative check above stays fatal.
     ref_dir = os.path.basename(str(ref.get("model_dir", "")).rstrip("/")).lower()
-    if ref_dir and _MODEL_HINT[args.model] not in ref_dir:
-        sys.exit(f"dataset {data} was generated from '{ref['model_dir']}', "
-                 f"which is not a {args.model} model")
+    hint = _MODEL_HINT.get(args.model)
+    if ref_dir and hint and hint not in ref_dir and not stated:
+        warn(f"dataset {data} was generated from '{ref['model_dir']}', which does "
+             f"not look like a {args.model} model")
     if args.model_dir and ref_dir:
         got = os.path.basename(args.model_dir.rstrip("/")).lower()
         if got != ref_dir:
@@ -232,6 +236,19 @@ def score_tokens(args, model_dir, comps, thr):
         print(f"  shorter than reference    = {len(short)}/{len(comps)}"
               f"        [diagnostic]  worst: req{worst} "
               f"{len(gen[worst])} vs {len(comps[worst])} tokens")
+        # Every short generation the same length is a hard cap (STEPS below the
+        # reference length), not an engine defect. Grading that would report FAIL
+        # for a correct engine, so refuse to grade instead of scoring it.
+        caps = {len(gen[i]) for i in short}
+        if len(caps) == 1 and len(short) >= max(2, 0.05 * len(comps)):
+            cap = caps.pop()
+            # exit 2 = "not graded", same as --quick; 1 is reserved for a real FAIL
+            print(f"\n  RESULT: not graded -- {len(short)}/{len(comps)} generations "
+                  f"stop at exactly {cap} tokens, below the reference "
+                  f"(max {max(len(c) for c in comps)}).\n"
+                  f"  That is a generation cap, not an engine defect: re-run with "
+                  f"STEPS >= {max(len(c) for c in comps)}.", flush=True)
+            sys.exit(2)
         warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
              f"reference; if STEPS caps generation below the reference length "
              f"(max {max(len(c) for c in comps)}), the gate will fail a correct engine")

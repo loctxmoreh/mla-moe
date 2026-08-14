@@ -58,11 +58,11 @@ eval-gen: run
 # a fetched public/private set (see eval-fetch) to grade on the real request mix.
 DATA ?= tests/eval/$(MODEL)
 
-# Fetch the participant-facing 512-prompt set from the Hub into tests/eval/public/
-# (gitignored — it is a published artifact, not repo state). Same file layout as
-# the in-repo dev set, so every target below takes it via DATA=.
-# The fetch dir is derived from the set name, so a private set never lands on top
-# of the public one -- the path on disk always says which set it holds.
+# Fetch the participant-facing 512-prompt set from the Hub into
+# tests/eval/fetched/<set> (gitignored — a published artifact, not repo state).
+# Same file layout as the in-repo dev set, so every target below takes it via
+# DATA=. The directory is derived from the set name, so a private set never lands
+# on top of the public one: the path on disk always says which set it holds.
 PUBLIC_SET ?= thanhnx12/mla-moe-dataset-public
 FETCH_DIR   = tests/eval/fetched/$(notdir $(PUBLIC_SET))
 eval-fetch:
@@ -90,7 +90,7 @@ eval-warm:
 # MODELDIR is needed when the dataset's reference.json records a Hub repo id
 # rather than a local path (the public set does).
 eval: run
-	uv run $(if $(FUZZY),--extra fuzzy,) python tests/eval/eval.py $(MODEL) -d $(DATA) \
+	uv run $(if $(FUZZY),--extra fuzzy,) python tests/eval/eval.py $(MODEL) -d "$(DATA)" \
 	  $(if $(MODELDIR),--model-dir "$(MODELDIR)",) $(if $(FUZZY),--fuzzy,)
 
 # --- performance benchmark ------------------------------------------------
@@ -123,8 +123,8 @@ GETP_DEPS = $(if $(filter run ./run $(CURDIR)/run,$(RUN))$(filter $(realpath ./r
 getp: $(GETP_DEPS)
 	@test -x "$(RUN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
-	"$(RUN)" "$(MODELDIR)" getp $(DATA)/requests.txt \
-	  $(GETP_OUT) $(if $(STEPS),$(STEPS),)
+	"$(RUN)" "$(MODELDIR)" getp "$(DATA)/requests.txt" \
+	  "$(GETP_OUT)" $(if $(STEPS),$(STEPS),)
 
 # Correctness gate for the CANDIDATE'S engine: run the timed getp batch, then
 # score the token ids it wrote against the frozen golden completions. `make eval`
@@ -138,10 +138,10 @@ getp: $(GETP_DEPS)
 getp-eval: $(GETP_DEPS)
 	@test -x "$(RUN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
-	"$(RUN)" "$(MODELDIR)" getp $(DATA)/requests.txt \
-	  $(GETP_OUT) $(if $(STEPS),$(STEPS),)
+	"$(RUN)" "$(MODELDIR)" getp "$(DATA)/requests.txt" \
+	  "$(GETP_OUT)" $(if $(STEPS),$(STEPS),)
 	uv run $(if $(QUICK),,--extra fuzzy) python tests/eval/eval.py $(MODEL) \
-	  -d $(DATA) --tokens $(GETP_OUT) --model-dir "$(MODELDIR)" $(if $(QUICK),--quick,)
+	  -d "$(DATA)" --tokens "$(GETP_OUT)" --model-dir "$(MODELDIR)" $(if $(QUICK),--quick,)
 
 # Build the golden CPU reference binary `run-ref` from a TAGGED commit, isolated
 # from working-tree edits, so the GPU/HIP port always has a fixed, buildable
