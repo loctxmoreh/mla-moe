@@ -19,8 +19,11 @@ one readable C codebase where every operation is explicit and auditable.
   before any `uv run python ...` command below. The METEOR/BERTScore accuracy
   tier needs the `fuzzy` extra (`uv sync --extra fuzzy`); `make getp-eval` and
   `make eval FUZZY=1` pull it in for you. That tier also downloads metric scripts,
-  nltk data and roberta-large on first use — run `make eval-warm` once on a
-  networked machine to fill the caches, after which `HF_HUB_OFFLINE=1` works.
+  nltk data and roberta-large on first use. Run `make eval-warm` once on a
+  networked machine to fill those caches; after that `HF_HUB_OFFLINE=1 make
+  getp-eval ...` works offline (verified — `HF_DATASETS_OFFLINE` is not needed).
+  Skipping `eval-warm` on an offline box makes the accuracy tier exit with a
+  message naming the target, rather than a traceback.
 - **Model weights**: checkpoints are plain HF directories (`config.json` +
   `model.safetensors.index.json` + shards), mmap'd directly — no download or
   conversion step. On the shared cluster they live at

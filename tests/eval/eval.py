@@ -127,6 +127,17 @@ def parse_ppl(out):
 
 _MODEL_HINT = {"dsv2lite": "deepseek", "glm47": "glm"}
 
+# Warnings are re-printed next to RESULT: a caution that scrolls past 512
+# diagnostic lines is a caution nobody reads, and the cases that raise one
+# (wrong --model-dir, generation shorter than the reference) produce a
+# plausible-looking verdict rather than an obvious failure.
+_WARNINGS = []
+
+
+def warn(msg):
+    _WARNINGS.append(msg)
+    print(f"  WARNING: {msg}", flush=True)
+
 
 def check_dataset_model(args, ref, data):
     """Fail fast when MODEL, DATA and --model-dir do not describe the same model.
@@ -152,8 +163,8 @@ def check_dataset_model(args, ref, data):
     if args.model_dir and ref_dir:
         got = os.path.basename(args.model_dir.rstrip("/")).lower()
         if got != ref_dir:
-            print(f"  WARNING: --model-dir is '{got}' but the dataset was generated "
-                  f"from '{ref_dir}'", flush=True)
+            warn(f"--model-dir is '{got}' but the dataset was generated from "
+                 f"'{ref_dir}' -- the engine may be running the wrong weights")
 
 
 def common_prefix(a, b):
@@ -212,6 +223,19 @@ def score_tokens(args, model_dir, comps, thr):
           f" ({len(bad)/len(fracs)*100:.2f}%)        [diagnostic]"
           + (f"  reqs {bad[:8]}{'...' if len(bad) > 8 else ''}" if bad else ""))
 
+    # Truncating over-long generations is free, but a generation SHORTER than the
+    # reference silently costs recall on every metric. The usual cause is STEPS
+    # capped below the reference completion length, which fails a correct engine.
+    short = [i for i, (g, c) in enumerate(zip(gen, comps)) if len(g) < len(c)]
+    if short:
+        worst = min((len(gen[i]) - len(comps[i]), i) for i in short)[1]
+        print(f"  shorter than reference    = {len(short)}/{len(comps)}"
+              f"        [diagnostic]  worst: req{worst} "
+              f"{len(gen[worst])} vs {len(comps[worst])} tokens")
+        warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
+             f"reference; if STEPS caps generation below the reference length "
+             f"(max {max(len(c) for c in comps)}), the gate will fail a correct engine")
+
     if args.quick:
         return None                      # nothing was gated
     preds = [g[:len(c)] for g, c in zip(gen, comps)]
@@ -236,6 +260,8 @@ def main():
         print(f"[{args.model}] {args.tokens}  ({n} requests)", flush=True)
         ok = score_tokens(args, model_dir, comps, thr)
         print()
+        for w in _WARNINGS:
+            print(f"  WARNING: {w}")
         if ok is None:      # --quick: diagnostics only, so say so rather than pass
             print("  RESULT: not graded (--quick skipped the accuracy gate)")
             sys.exit(2)
@@ -299,23 +325,38 @@ def main():
     sys.exit(0 if ok else 1)
 
 
+_WARM = ("run `make eval-warm` once on a networked machine to fill the metric, "
+         "nltk and roberta-large caches; HF_HUB_OFFLINE=1 works after that")
+
+
 def score_fuzzy(model_dir, pred_ids, ref_ids, thr):
     """Detokenize both sides and score METEOR + BERTScore. Heavy deps."""
     from transformers import AutoTokenizer
-    import evaluate  # noqa
+    try:
+        import evaluate  # noqa
+    except ModuleNotFoundError:
+        sys.exit("the accuracy tier needs the `fuzzy` extra: `uv sync --extra fuzzy`")
     tok = AutoTokenizer.from_pretrained(model_dir)
     preds = [tok.decode(ids) for ids in pred_ids]
     refs = [tok.decode(ids) for ids in ref_ids]
-    meteor = evaluate.load("meteor").compute(predictions=preds, references=refs)["meteor"]
+    try:
+        meteor = evaluate.load("meteor").compute(predictions=preds, references=refs)["meteor"]
+    except Exception as e:
+        sys.exit(f"could not load or run the METEOR metric ({type(e).__name__}: {e})\n"
+                 f"  If this machine is offline or the caches are cold, {_WARM}.")
     # BERTScore's tokenizer raises on an empty/whitespace-only prediction, which a
     # request that generated nothing produces. Score those 0 (maximally wrong) and
     # keep them out of the compute call, rather than crashing the gate.
     live = [i for i, p in enumerate(preds) if p.strip()]
     f1s = [0.0] * len(preds)
     if live:
-        bs = evaluate.load("bertscore").compute(
-            predictions=[preds[i] for i in live],
-            references=[refs[i] for i in live], lang="en")
+        try:
+            bs = evaluate.load("bertscore").compute(
+                predictions=[preds[i] for i in live],
+                references=[refs[i] for i in live], lang="en")
+        except Exception as e:
+            sys.exit(f"could not load or run BERTScore ({type(e).__name__}: {e})\n"
+                     f"  If this machine is offline or the caches are cold, {_WARM}.")
         for i, v in zip(live, bs["f1"]):
             f1s[i] = v
     f1 = sum(f1s) / len(f1s)

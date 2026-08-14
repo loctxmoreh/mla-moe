@@ -116,7 +116,10 @@ GETP_OUT  = $(if $(OUT),$(OUT),$(CURDIR)/getp_$(MODEL)_$(subst /,_,$(DATA)).txt)
 # Building the working tree is only a prerequisite when RUN is that build: a
 # submitted binary must be gradeable on a tree that does not compile.
 RUN      ?= ./run
-GETP_DEPS = $(if $(filter ./run,$(RUN)),run,)
+# Match by name AND by resolved path, so `run`, `./run`, `$(CURDIR)/run` and any
+# symlinked alias of the same file all rebuild. realpath is empty before the first
+# build, which is why the textual filter stays as the fallback.
+GETP_DEPS = $(if $(filter run ./run $(CURDIR)/run,$(RUN))$(filter $(realpath ./run),$(realpath $(RUN))),run,)
 getp: $(GETP_DEPS)
 	@test -x "$(RUN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
