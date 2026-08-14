@@ -78,7 +78,12 @@ def parse_args():
     p.add_argument("--thresholds", default=os.path.join(_HERE, "threshold.json"))
     p.add_argument("--fuzzy", action="store_true")
     p.add_argument("--max-new", type=int, default=None)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.steps is not None and args.steps < 1:
+        # getp_eval.c raises steps<=0 to GETP_DEFAULT_STEPS, so the hint would
+        # describe a run that never happened.
+        p.error("--steps must be >= 1 (the harness raises 0 to its own default)")
+    return args
 
 
 def read_id_lines(path):
@@ -99,6 +104,12 @@ def run_c(run_bin, model_dir, ids, *mode):
     try:
         return subprocess.run([run_bin, model_dir, path, *map(str, mode)],
                               capture_output=True, text=True, check=True).stdout
+    except subprocess.CalledProcessError as e:
+        print_warnings()
+        print(f"engine failed: {run_bin} exited {e.returncode} "
+              f"(mode {' '.join(map(str, mode))}). A wrong model dir is the usual "
+              f"cause.\n{(e.stderr or '').strip()[:400]}", file=sys.stderr)
+        sys.exit(3)                      # environment fault, not a gate failure
     finally:
         os.unlink(path)
 
@@ -285,7 +296,7 @@ def score_tokens(args, model_dir, comps, thr):
         # Prefer the requested cap only when it explains at least as many requests
         # as the measured one; a couple of requests ending exactly at STEPS must
         # not hide a larger cap somewhere else.
-        if args.steps and counts.get(args.steps, 0) >= n_at_cap:
+        if args.steps is not None and counts.get(args.steps, 0) >= n_at_cap:
             cap, n_at_cap = args.steps, counts[args.steps]
         longest = max(len(c) for c in comps)
         # cap 0 is not reachable (getp_eval.c floors steps<=0 at GETP_DEFAULT_STEPS),
@@ -293,11 +304,11 @@ def score_tokens(args, model_dir, comps, thr):
         # If STEPS is at least the longest reference, no cap can explain a short
         # generation: the engine truncated on its own, which is a real defect and
         # must reach the gate rather than be excused as a misconfiguration.
-        capped = (args.steps or 0) < longest
+        capped = (args.steps if args.steps is not None else 0) < longest
         # A STEPS cap stops generation AT the requested count, so a stop far below
         # it is the engine truncating itself. One token of tolerance keeps an
         # off-by-one engine loop inside the check.
-        explained = cap >= args.steps - 1 if args.steps else True
+        explained = cap >= args.steps - 1 if args.steps is not None else True
         if capped and explained and cap > 0 \
                 and n_at_cap >= max(2, thr.get("getp_cap_quorum", 0.05) * len(comps)) \
                 and cap < longest:
@@ -309,10 +320,14 @@ def score_tokens(args, model_dir, comps, thr):
                   f"  That is a generation cap, not an engine defect: re-run with "
                   f"STEPS >= {longest}.", flush=True)
             sys.exit(2)
-        if capped:
+        if capped and explained:
             warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
                  f"reference; if STEPS caps generation below the reference length "
                  f"(max {longest}), the gate will fail a correct engine")
+        elif capped:
+            warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
+                 f"reference and stop at {cap}, far below STEPS={args.steps} -- the "
+                 f"engine stopped early itself")
         else:
             warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
                  f"reference, and STEPS={args.steps} cannot be the cause (>= the "
@@ -338,9 +353,14 @@ def main():
         print(f"cannot read the dataset or thresholds ({type(e).__name__}: {e})",
               file=sys.stderr)
         sys.exit(2)                      # misconfiguration, not a gate failure
-    missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix") if k not in thr]
+    missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
+                           "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
     if missing:
         print(f"{args.thresholds} is missing required key(s): {', '.join(missing)}",
+              file=sys.stderr)
+        sys.exit(2)
+    if not args.model_dir and "model_dir" not in ref:
+        print(f"{data}/reference.json has no 'model_dir': pass --model-dir",
               file=sys.stderr)
         sys.exit(2)
     model_dir = args.model_dir or ref["model_dir"]
@@ -391,6 +411,11 @@ def main():
         sd = score_rows(rows["D"], plen, args.tie)
         # --- Tier 2: perplexity rel-err vs frozen HF nll ---
         c_nll, c_ntok = parse_ppl(run_c(args.run, model_dir, full, "ppl"))
+        if c_nll is None or not c_ntok:
+            print_warnings()
+            print(f"{args.run} printed no 'nll' line in ppl mode -- wrong binary or "
+                  f"a build without the eval modes", file=sys.stderr)
+            sys.exit(3)                  # environment fault, not a gate failure
         hf_ppl = math.exp(rec["hf_nll"] / rec["hf_ntok"])
         c_ppl = math.exp(c_nll / c_ntok)
         rel = abs(c_ppl - hf_ppl) / hf_ppl

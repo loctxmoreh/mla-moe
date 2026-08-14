@@ -41,7 +41,10 @@ RUN_C_OBJS = $(RUN_C_SRCS:.c=.o)
 HIP_OBJS   = $(HIP_SRCS:.hip=.o)
 TOOL_SRCS  = $(LIB_SRCS) src/main.c
 
-.PHONY: all clean tok-cli eval eval-gen eval-fetch eval-warm ref-binary bench getp getp-eval
+.PHONY: all clean tok-cli eval eval-gen eval-fetch eval-warm ref-binary bench getp getp-eval print-getp-steps
+
+# For grading scripts: the steps value the targets would use, so no third copy.
+print-getp-steps: ; @echo $(GETP_STEPS)
 
 all: run mla-moe
 
@@ -70,8 +73,11 @@ RUN_BIN   = $(if $(findstring /,$(RUN)),$(RUN),./$(RUN))
 # build, which is why the textual filter stays as the fallback.
 GETP_DEPS = $(if $(filter run ./run $(CURDIR)/run,$(RUN))$(filter $(realpath ./run),$(realpath $(RUN))),run,)
 # The steps count has ONE definition, read from the C harness so the two cannot
-# drift: it is passed to the binary and to eval.py --steps.
-GETP_DEFAULT_STEPS = $(shell sed -n 's/^\#define GETP_DEFAULT_STEPS *\([0-9]*\).*/\1/p' src/getp_eval.c)
+# drift: it is passed to the binary and to eval.py --steps. $(CURDIR) keeps the
+# read working under `make -f <repo>/Makefile` from another directory; the
+# recipes assert the result is non-empty before spending a timed run on it.
+GETP_DEFAULT_STEPS = $(shell sed -n 's/^\#define GETP_DEFAULT_STEPS *\([0-9]*\).*/\1/p' \
+                       $(CURDIR)/src/getp_eval.c)
 GETP_STEPS = $(if $(STEPS),$(STEPS),$(GETP_DEFAULT_STEPS))
 
 # DATA selects the dataset dir. Defaults to the small in-repo dev set; point it at
@@ -134,6 +140,7 @@ MODELDIR ?= $(if $(filter glm47,$(MODEL)),$(GLM),$(DSV))
 GETP_OUT  = $(if $(OUT),$(OUT),$(CURDIR)/getp_$(MODEL)_$(subst /,_,$(DATA)).txt)
 getp: $(GETP_DEPS)
 	@test -n "$(RUN)" -a -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
+	@test -n "$(GETP_STEPS)" || { echo "cannot read GETP_DEFAULT_STEPS from src/getp_eval.c -- pass STEPS=<n>"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
 	"$(RUN_BIN)" "$(MODELDIR)" getp "$(DATA)/requests.txt" \
 	  "$(GETP_OUT)" $(GETP_STEPS)
@@ -145,13 +152,15 @@ getp: $(GETP_DEPS)
 # it produced it -- batched, continuous-batched, or one request at a time.
 # GETP_STEPS is the single source for the steps value: it is passed to the binary
 # AND to eval.py --steps, so the hint can never disagree with what actually ran.
-# The 128 must track GETP_DEFAULT_STEPS in src/getp_eval.c.
+# Its default comes from GETP_DEFAULT_STEPS in src/getp_eval.c (read above), so
+# this file holds no copy of the number.
 # The gate is the announced accuracy gate (METEOR + BERTScore-F1); prefix agreement
 # prints as a diagnostic and does not decide the verdict, because a bf16/fp8 engine
 # legitimately diverges from the fp32 reference. QUICK=1 skips the accuracy tier and
 # its heavy deps, printing diagnostics only (exit 2 -- it grades nothing).
 getp-eval: $(GETP_DEPS)
 	@test -n "$(RUN)" -a -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
+	@test -n "$(GETP_STEPS)" || { echo "cannot read GETP_DEFAULT_STEPS from src/getp_eval.c -- pass STEPS=<n>"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
 	"$(RUN_BIN)" "$(MODELDIR)" getp "$(DATA)/requests.txt" \
 	  "$(GETP_OUT)" $(GETP_STEPS)
