@@ -169,7 +169,9 @@ def check_dataset_model(args, ref, data):
         if os.path.exists(man):
             stated = json.load(open(man)).get("model")
     if stated and stated != args.model:
-        sys.exit(f"dataset {data} is for model '{stated}', but MODEL={args.model}")
+        print(f"dataset {data} is for model '{stated}', but MODEL={args.model}",
+              file=sys.stderr)
+        sys.exit(2)                      # misconfiguration, not a gate failure
 
     # model_dir is provenance -- the weight-directory name on the machine that
     # generated the set -- so a rename there must not block a consistent dataset.
@@ -209,7 +211,9 @@ def score_tokens(args, model_dir, comps, thr):
         raw.pop()
     gen = [[int(x) for x in ln.split()] for ln in raw]
     if len(gen) != len(comps):
-        sys.exit(f"{args.tokens}: {len(gen)} lines != {len(comps)} requests in the dataset")
+        print(f"{args.tokens}: {len(gen)} lines != {len(comps)} requests in the dataset",
+              file=sys.stderr)
+        sys.exit(2)                      # misconfiguration, not a gate failure
 
     print("  gate: " + ("(none -- --quick skips the accuracy tier)" if args.quick else
                         f"meteor>={thr['meteor']}  bertscore_f1>={thr['bertscore_f1']}"),
@@ -259,12 +263,16 @@ def score_tokens(args, model_dir, comps, thr):
         # Prefer the cap the caller actually asked for; fall back to the most
         # common short length when --steps was not passed.
         from collections import Counter
-        if args.steps:
-            cap, n_at_cap = args.steps, sum(1 for i in short if len(gen[i]) == args.steps)
-        else:
-            cap, n_at_cap = Counter(len(gen[i]) for i in short).most_common(1)[0]
+        counts = Counter(len(gen[i]) for i in short)
+        # --steps is a HINT, not a switch: an engine whose own loop stops one token
+        # early would otherwise match nothing and escape the check entirely.
+        cap, n_at_cap = (args.steps, counts.get(args.steps, 0)) if args.steps else (0, 0)
+        if not n_at_cap:
+            cap, n_at_cap = counts.most_common(1)[0]
         longest = max(len(c) for c in comps)
-        if n_at_cap >= max(2, 0.05 * len(comps)) and cap < longest:
+        # cap 0 is not reachable (getp_eval.c floors steps<=0 at GETP_DEFAULT_STEPS),
+        # so an engine emitting nothing is a real failure, not a misconfiguration.
+        if cap > 0 and n_at_cap >= max(2, 0.05 * len(comps)) and cap < longest:
             print_warnings()
             # exit 2 = "not graded", same as --quick; 1 is reserved for a real FAIL
             print(f"\n  RESULT: not graded -- {n_at_cap}/{len(comps)} generations "
@@ -309,7 +317,9 @@ def main():
         sys.exit(0 if ok else 1)
 
     if not os.path.exists(args.run):
-        sys.exit(f"C run binary not found: {args.run} (build with `make run`)")
+        print(f"C run binary not found: {args.run} (build with `make run`)",
+              file=sys.stderr)
+        sys.exit(3)                      # environment fault, not a gate failure
     print(f"[{args.model}] {model_dir}  ({n} requests)  tie={args.tie:.1e}", flush=True)
     print(f"  gates: top1_strict>={thr['top1_strict']}  ppl_rel<={thr['ppl_rel']}"
           + (f"  meteor>={thr['meteor']}  bertscore_f1>={thr['bertscore_f1']}" if args.fuzzy else ""),

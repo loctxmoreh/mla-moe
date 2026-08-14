@@ -248,6 +248,11 @@ derails every token after it, so an engine using bf16/fp8 weights or a bf16 KV c
 diverges from the fp32 reference while still being correct. `QUICK=1` prints the
 diagnostics and skips the accuracy tier's heavy deps (it grades nothing, and exits 2).
 
+Exit codes, for anyone driving this from a script: **0** ok, **1** the gate failed,
+**2** not graded (nothing was scored — `QUICK=1`, a misconfiguration, or a generation
+capped below the reference length), **3** environment fault (missing deps, cold cache,
+no network, no engine binary). Only **1** is a candidate failure.
+
 `STEPS`/`OUT`/`RUN` are overridable as with `make getp` (`RUN=./run-ref` or
 `RUN=./submission` scores another binary); generating past the golden completion
 length is fine, the surplus is ignored, so one timed run yields both numbers.

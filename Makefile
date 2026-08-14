@@ -135,6 +135,8 @@ getp: $(GETP_DEPS)
 # only exercises the frozen single-sequence paths in run.c, so it says nothing
 # about inference(); this scores inference()'s OWN output and is agnostic to how
 # it produced it -- batched, continuous-batched, or one request at a time.
+# --steps mirrors GETP_DEFAULT_STEPS in src/getp_eval.c (the source of truth), so a
+# generation capped below the reference length is reported rather than graded.
 # The gate is the announced accuracy gate (METEOR + BERTScore-F1); prefix agreement
 # prints as a diagnostic and does not decide the verdict, because a bf16/fp8 engine
 # legitimately diverges from the fp32 reference. QUICK=1 skips the accuracy tier and
@@ -146,7 +148,7 @@ getp-eval: $(GETP_DEPS)
 	  "$(GETP_OUT)" $(if $(STEPS),$(STEPS),)
 	uv run $(if $(QUICK),,--extra fuzzy) python tests/eval/eval.py $(MODEL) \
 	  -d "$(DATA)" --tokens "$(GETP_OUT)" --model-dir "$(MODELDIR)" \
-	  $(if $(STEPS),--steps $(STEPS),) $(if $(QUICK),--quick,)
+	  --steps $(if $(STEPS),$(STEPS),128) $(if $(QUICK),--quick,)
 
 # Build the golden CPU reference binary `run-ref` from a TAGGED commit, isolated
 # from working-tree edits, so the GPU/HIP port always has a fixed, buildable
