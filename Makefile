@@ -44,7 +44,9 @@ TOOL_SRCS  = $(LIB_SRCS) src/main.c
 .PHONY: all clean tok-cli eval eval-gen eval-fetch eval-warm ref-binary bench getp getp-eval print-getp-steps
 
 # For grading scripts: the steps value the targets would use, so no third copy.
-print-getp-steps: ; @echo $(GETP_STEPS)
+print-getp-steps:
+	@test "$(GETP_STEPS)" -ge 1 2>/dev/null || { echo "STEPS must be an integer >= 1 (got '$(GETP_STEPS)') -- or src/getp_eval.c is unreadable" >&2; exit 1; }
+	@echo $(GETP_STEPS)
 
 all: run mla-moe
 
@@ -73,11 +75,13 @@ RUN_BIN   = $(if $(findstring /,$(RUN)),$(RUN),./$(RUN))
 # build, which is why the textual filter stays as the fallback.
 GETP_DEPS = $(if $(filter run ./run $(CURDIR)/run,$(RUN))$(filter $(realpath ./run),$(realpath $(RUN))),run,)
 # The steps count has ONE definition, read from the C harness so the two cannot
-# drift: it is passed to the binary and to eval.py --steps. $(CURDIR) keeps the
-# read working under `make -f <repo>/Makefile` from another directory; the
-# recipes assert the result is non-empty before spending a timed run on it.
+# drift: it is passed to the binary and to eval.py --steps. The path is anchored
+# to THIS makefile's directory, not $(CURDIR) -- make sets CURDIR to the working
+# directory, so `make -f <repo>/Makefile` from elsewhere would not find the file.
+# The recipes assert the result is a usable integer before spending a timed run.
+GETP_MK_DIR = $(dir $(firstword $(MAKEFILE_LIST)))
 GETP_DEFAULT_STEPS = $(shell sed -n 's/^\#define GETP_DEFAULT_STEPS *\([0-9]*\).*/\1/p' \
-                       $(CURDIR)/src/getp_eval.c)
+                       $(GETP_MK_DIR)src/getp_eval.c)
 GETP_STEPS = $(if $(STEPS),$(STEPS),$(GETP_DEFAULT_STEPS))
 
 # DATA selects the dataset dir. Defaults to the small in-repo dev set; point it at
@@ -140,7 +144,7 @@ MODELDIR ?= $(if $(filter glm47,$(MODEL)),$(GLM),$(DSV))
 GETP_OUT  = $(if $(OUT),$(OUT),$(CURDIR)/getp_$(MODEL)_$(subst /,_,$(DATA)).txt)
 getp: $(GETP_DEPS)
 	@test -n "$(RUN)" -a -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
-	@test -n "$(GETP_STEPS)" || { echo "cannot read GETP_DEFAULT_STEPS from src/getp_eval.c -- pass STEPS=<n>"; exit 1; }
+	@test "$(GETP_STEPS)" -ge 1 2>/dev/null || { echo "STEPS must be an integer >= 1 (got '$(GETP_STEPS)') -- or src/getp_eval.c is unreadable"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
 	"$(RUN_BIN)" "$(MODELDIR)" getp "$(DATA)/requests.txt" \
 	  "$(GETP_OUT)" $(GETP_STEPS)
@@ -160,7 +164,7 @@ getp: $(GETP_DEPS)
 # its heavy deps, printing diagnostics only (exit 2 -- it grades nothing).
 getp-eval: $(GETP_DEPS)
 	@test -n "$(RUN)" -a -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
-	@test -n "$(GETP_STEPS)" || { echo "cannot read GETP_DEFAULT_STEPS from src/getp_eval.c -- pass STEPS=<n>"; exit 1; }
+	@test "$(GETP_STEPS)" -ge 1 2>/dev/null || { echo "STEPS must be an integer >= 1 (got '$(GETP_STEPS)') -- or src/getp_eval.c is unreadable"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
 	"$(RUN_BIN)" "$(MODELDIR)" getp "$(DATA)/requests.txt" \
 	  "$(GETP_OUT)" $(GETP_STEPS)

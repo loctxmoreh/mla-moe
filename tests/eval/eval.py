@@ -338,9 +338,14 @@ def score_tokens(args, model_dir, comps, thr):
                  f"reference; if STEPS caps generation below the reference length "
                  f"(max {longest}), the gate will fail a correct engine")
         elif capped:
-            warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
-                 f"reference and stop at {cap}, far below STEPS={args.steps} -- the "
-                 f"engine stopped early itself")
+            # Only n_at_cap requests stop at `cap`; a mixed run can also hold
+            # requests that stop exactly at STEPS, and those ARE capped.
+            n_at_steps = counts.get(args.steps, 0)
+            warn(f"{n_at_cap}/{len(comps)} of the {len(short)} short requests stop at "
+                 f"{cap}, far below STEPS={args.steps} -- the engine stopped early itself"
+                 + (f"; {n_at_steps} other request(s) stop at exactly STEPS="
+                    f"{args.steps}, which IS a cap below the reference (max {longest})"
+                    if n_at_steps else ""))
         else:
             warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
                  f"reference, and STEPS={args.steps} cannot be the cause (>= the "
