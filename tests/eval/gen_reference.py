@@ -37,6 +37,9 @@ import load_oracle  # noqa: E402  (model_dir single-sourced from the oracle mani
 import transformers  # noqa: E402
 
 
+_RUN_C_MAX_IDS = 4096      # src/run.c read_tokens_i32 reads at most this many
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("model", nargs="?", default="dsv2lite", choices=["dsv2lite", "glm47"])
@@ -44,13 +47,15 @@ def parse_args():
                    help="requests file (default <model>/requests.txt)")
     p.add_argument("-o", "--out", default=None, help="output dir (default <model>/)")
     p.add_argument("--max-new", type=int, default=64, help="tokens to greedy-generate per prompt")
-    p.add_argument("--max-tokens", type=int, default=4096, help="C-engine buffer cap (full seq)")
+    p.add_argument("--max-tokens", type=int, default=_RUN_C_MAX_IDS,
+                   help="C-engine buffer cap (full seq)")
     args = p.parse_args()
     # src/run.c reads at most 4096 ids, and tests/eval/eval.py refuses a dataset
     # that exceeds it. A larger value here would freeze a set no run can grade.
-    if not 2 <= args.max_tokens <= 4096:
-        p.error("--max-tokens must be in [2, 4096] (4096 is the read limit in "
-                "src/run.c; below 2 no prompt fits)")
+    if not 2 <= args.max_tokens <= _RUN_C_MAX_IDS:
+        p.error(f"--max-tokens must be in [2, {_RUN_C_MAX_IDS}] "
+                f"({_RUN_C_MAX_IDS} is the read limit in src/run.c; "
+                f"below 2 no prompt fits)")
     if args.max_new < 1:
         p.error("--max-new must be >= 1")
     return args

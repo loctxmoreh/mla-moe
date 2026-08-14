@@ -209,8 +209,10 @@ def _kv_capacity(model_dir):
     KV_CACHE_CAP). Falls back to _MAX_SEQ when the config cannot be read."""
     try:
         cfg = json.load(open(os.path.join(model_dir, "config.json")))
+        if not isinstance(cfg, dict):
+            return _MAX_SEQ
         return min(int(cfg.get("max_position_embeddings", 163840)), 163840)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         return _MAX_SEQ
 
 
@@ -476,15 +478,17 @@ def main():
 
 
     if args.tokens is None:              # path A: the only path that drives run.c
-        # src/run.c reads at most _MAX_SEQ ids, so a longer sequence is truncated
-        # there and the ppl token counts then disagree. Both lengths are known
-        # before the engine runs, so this costs no timed pass.
+        # Two limits, and the smaller binds: src/run.c reads at most _MAX_SEQ ids
+        # (a longer sequence is truncated, and the ppl token counts then
+        # disagree), and teacher/ppl both hand the whole sequence to
+        # forward_unabsorbed, which writes kv_l[p * KVD] for every position.
+        cap = min(_MAX_SEQ, _kv_capacity(model_dir))
         too_long = [i for i, (p, c) in enumerate(zip(prompts, comps))
-                    if len(p) + len(c) > _MAX_SEQ]
+                    if len(p) + len(c) > cap]
         if too_long:
             print_warnings()
-            print(f"{data}: request(s) {too_long[:8]} exceed the {_MAX_SEQ}-token "
-                  f"limit of src/run.c -- regenerate the dataset with a smaller "
+            print(f"{data}: request(s) {too_long[:8]} exceed the {cap}-token limit "
+                  f"of src/run.c -- regenerate the dataset with a smaller "
                   f"--max-tokens", file=sys.stderr)
             sys.exit(2)                  # a harness limit, not a gate failure
 
@@ -517,7 +521,6 @@ def main():
             # The write bound is the KV cache, sized from the model config, not
             # the id-read limit; they coincide for the exam models but not by
             # construction. Take whichever is smaller.
-            cap = min(_MAX_SEQ, _kv_capacity(model_dir))
             over = [i for i, (p, r) in enumerate(zip(prompts, recs))
                     if len(p) + (args.max_new or int(r["completion_len"])) > cap]
             if over:
@@ -583,6 +586,14 @@ def main():
         rows = parse_teacher(out, plen)
         sp = score_rows(rows["P"], plen, args.tie)
         sd = score_rows(rows["D"], plen, args.tie)
+        if sp is not None and sd is not None and sp[2] != sd[2]:
+            # Per request, not on the totals: a build that is short on one
+            # request and long on another cancels in the sum.
+            print_warnings()
+            print(f"{args.run} printed {sp[2]} prefill rows against {sd[2]} decode "
+                  f"rows for request {i} -- the two top-1 numbers are not "
+                  f"comparable", file=sys.stderr)
+            sys.exit(3)                  # environment fault, not a gate failure
         if sp is None or sd is None:
             print_warnings()
             print(f"{args.run} printed no teacher row for the completion region of "
@@ -612,13 +623,11 @@ def main():
             nonfinite.append(i)
             rel = float("inf")
         worst_ppl = max(worst_ppl, rel)
-        if sd:
-            tot["D_ok"] += round(sd[0] * sd[2]); tot["cmp"] += sd[2]
-            all_misses += [(i, "D", *m) for m in sd[3]]
-        if sp:
-            all_misses += [(i, "P", *m) for m in sp[3]]
-        if sp:
-            tot["P_ok"] += round(sp[0] * sp[2]); tot["P_cmp"] += sp[2]
+        # Both are 4-tuples here: the None case exited above.
+        tot["D_ok"] += round(sd[0] * sd[2]); tot["cmp"] += sd[2]
+        tot["P_ok"] += round(sp[0] * sp[2]); tot["P_cmp"] += sp[2]
+        all_misses += [(i, "D", *m) for m in sd[3]]
+        all_misses += [(i, "P", *m) for m in sp[3]]
         print(f"  [{i}] comp={sd[2] if sd else 0:4d}  "
               f"P_top1={sp[0]*100:6.2f}% (tie {sp[1]*100:6.2f}%)  "
               f"D_top1={sd[0]*100:6.2f}% (tie {sd[1]*100:6.2f}%)  "
@@ -632,28 +641,26 @@ def main():
         warn(f"{len(mismatched)}/{n} request(s) scored a different number of ppl "
              f"targets than the reference (e.g. request {i}: {got} vs {want}) -- the "
              f"two perplexities are not comparable")
-    if tot["P_cmp"] != tot["cmp"]:
-        # Equal counts are a property of the frozen run.c teacher mode, and
-        # p_strict divides by the decode count. A build that prints a different
-        # number of P rows is the same class as one that prints none: exit 3.
-        print_warnings()
-        print(f"{args.run} printed {tot['P_cmp']} prefill rows against "
-              f"{tot['cmp']} decode rows over the completion region -- the two "
-              f"top-1 numbers are not comparable", file=sys.stderr)
-        sys.exit(3)                      # environment fault, not a gate failure
     cmp = tot["cmp"] or 1
     d_strict = tot["D_ok"] / cmp
     p_strict = tot["P_ok"] / cmp
     print()
     print(f"  decode-path  top1_strict = {d_strict*100:.3f}%  ({tot['D_ok']}/{cmp})")
-    print(f"  prefill-path top1_strict = {p_strict*100:.3f}%")
+    print(f"  prefill-path top1_strict = {p_strict*100:.3f}%  ({tot['P_ok']}/{cmp})")
     print(f"  worst ppl rel-err        = {worst_ppl:.3e}")
     print(f"  ppl token-count mismatch = {len(mismatched)}/{n}")
     if all_misses:
-        print(f"  misses (path, pos, gold, argmax, gap), worst first:")
-        for req, path, pos, gold, am, gap in sorted(all_misses, key=lambda m: -m[5])[:10]:
-            print(f"    req{req} {path} pos{pos}: gold {gold} != argmax {am}  gap={gap:.4f}"
-                  + ("  [tie]" if gap <= args.tie else ""))
+        # Ranked per path: the two kernels have different gap scales, so one
+        # combined top-10 lets the larger-gap path hide the other entirely.
+        for path in ("D", "P"):
+            rows = [m for m in all_misses if m[1] == path]
+            if not rows:
+                continue
+            print(f"  {'decode' if path == 'D' else 'prefill'} misses "
+                  f"({len(rows)} total; pos, gold, argmax, gap), worst first:")
+            for req, _p, pos, gold, am, gap in sorted(rows, key=lambda m: -m[5])[:5]:
+                print(f"    req{req} pos{pos}: gold {gold} != argmax {am}  "
+                      f"gap={gap:.4f}" + ("  [tie]" if gap <= args.tie else ""))
 
     # Both paths gate: a prefill number printed beside RESULT: ok while reaching
     # no condition is the same asymmetry as a condition the gate line omits.
