@@ -20,9 +20,9 @@ A. DEFAULT -- drives the C `run` binary through its single-sequence eval modes:
   (160/160), prefill 100.000% (160/160), worst ppl rel-err 3.030e-05, ppl
   token-count mismatch 0/5. "160/160" is the NUMBER of scored rows, equal on
   both paths and enforced per request; the position values are not compared.
-  worst ppl rel-err 2.695e-05. The 0.99 threshold was calibrated against the
-  decode kernel; that run is the evidence for applying it to the prefill kernel
-  too, which uses a different forward and accumulates different rounding.
+  The 0.99 threshold was calibrated against the decode kernel; those runs are
+  the evidence for applying it to the prefill kernel too, which uses a different
+  forward and accumulates different rounding.
   A mismatch with logit gap <= --tie is a numerical tie, not an error (tie-tolerant
   column); the strict column gates.
 
@@ -223,12 +223,21 @@ def _read_const(path, name, default):
     one integer). The Makefile reads GETP_DEFAULT_STEPS out of the C source the
     same way.
     """
+    full = os.path.join(_HERE, path)
     try:
-        with open(os.path.join(_HERE, path)) as f:
-            m = re.search(rf"^{name}\s*=\s*(\d+)", f.read(), re.M)
-        return int(m.group(1)) if m else default
+        with open(full) as f:
+            # Anchored at both ends: an unanchored (\d+) matches a prefix, so a
+            # constant that grew a suffix or an expression would silently yield a
+            # wrong number instead of missing.
+            m = re.search(rf"^{name}\s*=\s*(\d+)\s*(?:#.*)?$", f.read(), re.M)
     except OSError:
+        return default                   # sibling absent: the mirror is expected
+    if m is None:
+        # Present but changed shape -- that is drift, and drift must not be quiet.
+        print(f"WARNING: {path} no longer defines {name} as a plain integer; "
+              f"falling back to {default}", file=sys.stderr)
         return default
+    return int(m.group(1))
 
 
 _RUN_C_MAX_IDS = _read_const("gen_reference.py", "_RUN_C_MAX_IDS", 4096)
@@ -576,18 +585,20 @@ def main():
         if too_long:
             print_warnings()
             tie = cap == _MAX_SEQ == kv_cap
-            src = ("both src/run.c's id-read limit and the KV cache from "
-                   f"{model_dir}/config.json" if tie else
-                   "src/run.c's id-read limit" if cap == _MAX_SEQ
+            _READ = "src/run.c's id-read limit, mirrored at tests/eval/eval.py:_MAX_SEQ"
+            src = (f"both {_READ} and the KV cache from {model_dir}/config.json"
+                   if tie else _READ if cap == _MAX_SEQ
                    else f"the KV cache sized from {model_dir}/config.json")
             # --max-tokens caps the COMPLETION and cannot shorten a prompt, and
             # gen_reference.py refuses any prompt with fewer than 2 free
             # positions -- so regeneration can only work when the LONGEST prompt
             # plus 2 fits under the limit.
             need = max(len(p) for p in prompts) + 2
-            raise_ = ("raise src/run.c's read limit AND use a model with a larger "
+            _RAISE = ("raise the read limit in src/run.c AND _MAX_SEQ in "
+                      "tests/eval/eval.py (the harness keeps its own copy)")
+            raise_ = (f"{_RAISE}, and use a model with a larger "
                       "max_position_embeddings (both bind)" if tie else
-                      "raise src/run.c's read limit" if cap == _MAX_SEQ
+                      _RAISE if cap == _MAX_SEQ
                       else "use a model with a larger max_position_embeddings")
             longest = need - 2               # the longest prompt itself
             if cap >= need:
