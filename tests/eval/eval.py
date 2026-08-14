@@ -213,8 +213,10 @@ _KV_CACHE_CAP = 163840     # src/model_load.c KV_CACHE_CAP
 
 
 def _kv_capacity(model_dir):
-    """max_seq_len as src/model_load.c computes it: min(max_position_embeddings,
-    KV_CACHE_CAP). Falls back to _MAX_SEQ when the config cannot be read.
+    """-> (cap, shown). cap is max_seq_len as src/model_load.c computes it:
+    min(max_position_embeddings, KV_CACHE_CAP). cap <= 0 means the engine cannot
+    load the model; `shown` is the raw config value, so the caller can quote what
+    the file actually holds rather than a sentinel.
 
     cfg_int() takes the default unless the value is a JSON number, so a numeric
     *string* must not be accepted here either -- int("2048") would make the two
@@ -226,19 +228,20 @@ def _kv_capacity(model_dir):
         with open(os.path.join(model_dir, "config.json")) as f:
             cfg = json.load(f)
         if not isinstance(cfg, dict):
-            return _MAX_SEQ
+            return _MAX_SEQ, None
         maxpos = cfg.get("max_position_embeddings", _KV_CACHE_CAP)
         if isinstance(maxpos, bool) or not isinstance(maxpos, (int, float)):
-            return _MAX_SEQ              # cfg_int() would take the default
-        maxpos = int(maxpos)
-        if not -2**31 <= maxpos < 2**31:
+            return _MAX_SEQ, None            # cfg_int() would take the default
+        if isinstance(maxpos, float) and not math.isfinite(maxpos):
+            return 0, maxpos                 # json gives inf for 1e400; C casts it
+        if not -2**31 <= int(maxpos) < 2**31:
             # cfg_int casts cJSON's valuedouble to a C int, so the value is lost
             # and max_seq_len is whatever the cast produced. Report it as
-            # unloadable rather than guess: 0 takes the load-refusal branch.
-            return 0
-        return min(maxpos, _KV_CACHE_CAP)
+            # unloadable rather than guess.
+            return 0, maxpos
+        return min(int(maxpos), _KV_CACHE_CAP), maxpos
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
-        return _MAX_SEQ
+        return _MAX_SEQ, None
 
 
 def _usable_len(rec):
@@ -507,7 +510,8 @@ def main():
         # (a longer sequence is truncated, and the ppl token counts then
         # disagree), and teacher/ppl both hand the whole sequence to
         # forward_unabsorbed, which writes kv_l[p * KVD] for every position.
-        cap = min(_MAX_SEQ, _kv_capacity(model_dir))
+        kv_cap, kv_shown = _kv_capacity(model_dir)
+        cap = min(_MAX_SEQ, kv_cap)
         if cap < 1:
             # Only a non-positive length is unloadable. A length of 0 makes
             # calloc return a zero-size block, and every layer then writes past
@@ -517,26 +521,35 @@ def main():
             # runs a one-token sequence, so that case belongs to the too_long
             # test below, which names the dataset instead.
             print_warnings()
-            print(f"{model_dir}/config.json gives a KV cache length of {cap}: the "
-                  f"engine cannot load this model", file=sys.stderr)
+            held = ("" if kv_shown is None
+                    else f" (max_position_embeddings = {kv_shown!r})")
+            print(f"{model_dir}/config.json{held} gives a KV cache length of "
+                  f"{kv_cap}: the engine cannot load this model", file=sys.stderr)
             sys.exit(3)                  # environment fault, not a gate failure
         too_long = [i for i, (p, c) in enumerate(zip(prompts, comps))
                     if len(p) + len(c) > cap]
         if too_long:
             print_warnings()
-            src = ("src/run.c's id-read limit" if cap == _MAX_SEQ
+            tie = cap == _MAX_SEQ == kv_cap
+            src = ("both src/run.c's id-read limit and the KV cache from "
+                   f"{model_dir}/config.json" if tie else
+                   "src/run.c's id-read limit" if cap == _MAX_SEQ
                    else f"the KV cache sized from {model_dir}/config.json")
             # --max-tokens caps the COMPLETION and cannot shorten a prompt, and
             # gen_reference.py refuses any prompt with fewer than 2 free
             # positions -- so regeneration can only work when the LONGEST prompt
             # plus 2 fits under the limit.
             need = max(len(p) for p in prompts) + 2
-            raise_ = ("raise src/run.c's read limit" if cap == _MAX_SEQ
+            raise_ = ("raise src/run.c's read limit AND use a model with a larger "
+                      "max_position_embeddings (both bind)" if tie else
+                      "raise src/run.c's read limit" if cap == _MAX_SEQ
                       else "use a model with a larger max_position_embeddings")
             fix = ("regenerate the dataset with a smaller --max-tokens"
                    if cap >= need else
                    f"no --max-tokens value helps: the longest prompt needs {need} "
-                   f"tokens to regenerate -- {raise_}, or shorten the prompts")
+                   f"tokens to regenerate -- regenerate with --max-tokens and "
+                   f"--max-new small enough that prompt+completion fits, or "
+                   f"{raise_}, or shorten the prompts")
             print(f"{data}: request(s) {too_long[:8]} exceed the {cap}-token limit "
                   f"({src}) -- {fix}", file=sys.stderr)
             sys.exit(2)                  # a harness limit, not a gate failure
