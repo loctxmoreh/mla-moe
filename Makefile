@@ -91,6 +91,7 @@ eval-warm:
 # rather than a local path (the public set does).
 eval: run
 	uv run $(if $(FUZZY),--extra fuzzy,) python tests/eval/eval.py $(MODEL) -d "$(DATA)" \
+	  $(if $(RUN),-r "$(RUN_BIN)",) \
 	  $(if $(MODELDIR),--model-dir "$(MODELDIR)",) $(if $(FUZZY),--fuzzy,)
 
 # --- performance benchmark ------------------------------------------------
@@ -98,8 +99,8 @@ eval: run
 # run-ref, or a future GPU binary). Override PREFILL/DECODE/REPS/OUT as needed.
 bench: run
 	uv run python tests/bench/bench.py $(MODEL) \
-	  $(if $(RUN),-r "$(RUN_BIN)",) $(if $(PREFILL),--prefill $(PREFILL),) \
-	  $(if $(DECODE),--decode $(DECODE),) $(if $(REPS),--reps $(REPS),) \
+	  $(if $(RUN),-r "$(RUN_BIN)",) $(if $(PREFILL),--prefill "$(PREFILL)",) \
+	  $(if $(DECODE),--decode "$(DECODE)",) $(if $(REPS),--reps "$(REPS)",) \
 	  $(if $(OUT),-o "$(OUT)",) $(if $(COMPARE),--compare "$(COMPARE)",)
 
 # Batch-throughput grading (the perf score). Runs the fixed request set through
@@ -120,35 +121,37 @@ RUN      ?= ./run
 # command searches PATH, which does not hold cwd -- exit 127 at run time, which
 # `make -n` cannot show. Make the path explicit for every bare-word spelling.
 RUN_BIN   = $(if $(findstring /,$(RUN)),$(RUN),./$(RUN))
+GETP_STEPS = $(if $(STEPS),$(STEPS),128)
 # Match by name AND by resolved path, so `run`, `./run`, `$(CURDIR)/run` and any
 # symlinked alias of the same file all rebuild. realpath is empty before the first
 # build, which is why the textual filter stays as the fallback.
 GETP_DEPS = $(if $(filter run ./run $(CURDIR)/run,$(RUN))$(filter $(realpath ./run),$(realpath $(RUN))),run,)
 getp: $(GETP_DEPS)
-	@test -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
+	@test -n "$(RUN)" -a -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
 	"$(RUN_BIN)" "$(MODELDIR)" getp "$(DATA)/requests.txt" \
-	  "$(GETP_OUT)" $(if $(STEPS),$(STEPS),)
+	  "$(GETP_OUT)" $(GETP_STEPS)
 
 # Correctness gate for the CANDIDATE'S engine: run the timed getp batch, then
 # score the token ids it wrote against the frozen golden completions. `make eval`
 # only exercises the frozen single-sequence paths in run.c, so it says nothing
 # about inference(); this scores inference()'s OWN output and is agnostic to how
 # it produced it -- batched, continuous-batched, or one request at a time.
-# --steps mirrors GETP_DEFAULT_STEPS in src/getp_eval.c (the source of truth), so a
-# generation capped below the reference length is reported rather than graded.
+# GETP_STEPS is the single source for the steps value: it is passed to the binary
+# AND to eval.py --steps, so the hint can never disagree with what actually ran.
+# The 128 must track GETP_DEFAULT_STEPS in src/getp_eval.c.
 # The gate is the announced accuracy gate (METEOR + BERTScore-F1); prefix agreement
 # prints as a diagnostic and does not decide the verdict, because a bf16/fp8 engine
 # legitimately diverges from the fp32 reference. QUICK=1 skips the accuracy tier and
 # its heavy deps, printing diagnostics only (exit 2 -- it grades nothing).
 getp-eval: $(GETP_DEPS)
-	@test -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
+	@test -n "$(RUN)" -a -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
 	"$(RUN_BIN)" "$(MODELDIR)" getp "$(DATA)/requests.txt" \
-	  "$(GETP_OUT)" $(if $(STEPS),$(STEPS),)
+	  "$(GETP_OUT)" $(GETP_STEPS)
 	uv run $(if $(QUICK),,--extra fuzzy) python tests/eval/eval.py $(MODEL) \
 	  -d "$(DATA)" --tokens "$(GETP_OUT)" --model-dir "$(MODELDIR)" \
-	  --steps $(if $(STEPS),$(STEPS),128) $(if $(QUICK),--quick,)
+	  --steps $(GETP_STEPS) $(if $(QUICK),--quick,)
 
 # Build the golden CPU reference binary `run-ref` from a TAGGED commit, isolated
 # from working-tree edits, so the GPU/HIP port always has a fixed, buildable

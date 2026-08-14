@@ -248,10 +248,21 @@ derails every token after it, so an engine using bf16/fp8 weights or a bf16 KV c
 diverges from the fp32 reference while still being correct. `QUICK=1` prints the
 diagnostics and skips the accuracy tier's heavy deps (it grades nothing, and exits 2).
 
-Exit codes, for anyone driving this from a script: **0** ok, **1** the gate failed,
-**2** not graded (nothing was scored — `QUICK=1`, a misconfiguration, or a generation
-capped below the reference length), **3** environment fault (missing deps, cold cache,
-no network, no engine binary). Only **1** is a candidate failure.
+**Exit codes are `tests/eval/eval.py`'s, not `make`'s.** GNU make reports its own
+status 2 for any failed recipe, so a script that drives `make getp-eval` cannot tell
+a gate failure from an environment fault. A grading script should run the timed
+batch with `make` and then call the scorer directly:
+
+```sh
+make getp MODEL=dsv2lite MODELDIR="$DSV" DATA="$DATA"        # timed run, writes the ids
+uv run --extra fuzzy python tests/eval/eval.py dsv2lite \
+  -d "$DATA" --tokens "$OUT" --model-dir "$DSV" --steps 128  # exit code below
+```
+
+**0** ok · **1** the gate failed · **2** not graded (nothing was scored — `--quick`, a
+misconfiguration, or a generation capped below the reference length) · **3**
+environment fault (missing deps, cold cache, no network, no engine binary). Only
+**1** is a candidate failure.
 
 `STEPS`/`OUT`/`RUN` are overridable as with `make getp` (`RUN=./run-ref` or
 `RUN=./submission` scores another binary); generating past the golden completion

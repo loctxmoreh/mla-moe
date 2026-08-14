@@ -169,6 +169,7 @@ def check_dataset_model(args, ref, data):
         if os.path.exists(man):
             stated = json.load(open(man)).get("model")
     if stated and stated != args.model:
+        print_warnings()
         print(f"dataset {data} is for model '{stated}', but MODEL={args.model}",
               file=sys.stderr)
         sys.exit(2)                      # misconfiguration, not a gate failure
@@ -206,11 +207,18 @@ def score_tokens(args, model_dir, comps, thr):
     """
     # Not read_id_lines(): a request that generated nothing writes an empty line,
     # and dropping it would misreport the failure as a line-count mismatch.
-    raw = open(args.tokens).read().split("\n")
+    try:
+        raw = open(args.tokens).read().split("\n")
+    except OSError as e:
+        print_warnings()
+        print(f"cannot read {args.tokens}: {e}", file=sys.stderr)
+        sys.exit(2)                      # misconfiguration, not a gate failure
+    
     if raw and raw[-1] == "":
         raw.pop()
     gen = [[int(x) for x in ln.split()] for ln in raw]
     if len(gen) != len(comps):
+        print_warnings()
         print(f"{args.tokens}: {len(gen)} lines != {len(comps)} requests in the dataset",
               file=sys.stderr)
         sys.exit(2)                      # misconfiguration, not a gate failure
@@ -240,7 +248,8 @@ def score_tokens(args, model_dir, comps, thr):
     bad = [i for i, f in enumerate(fracs) if f < thr["getp_min_prefix"]]
     print()
     print(f"  requests matching exactly = {n_exact}/{len(comps)}")
-    print(f"  mean prefix agreement     = {mean_prefix*100:.3f}%        [diagnostic]")
+    print(f"  mean prefix agreement     = {mean_prefix*100:.3f}%        [diagnostic, "
+          f"advisory floor {thr['getp_prefix']*100:.0f}%]")
     print(f"  worst request             = {min(fracs)*100:.3f}%        [diagnostic]")
     print(f"  below {thr['getp_min_prefix']*100:.0f}% floor           = {len(bad)}/{len(fracs)}"
           f" ({len(bad)/len(fracs)*100:.2f}%)        [diagnostic]"
@@ -266,13 +275,21 @@ def score_tokens(args, model_dir, comps, thr):
         counts = Counter(len(gen[i]) for i in short)
         # --steps is a HINT, not a switch: an engine whose own loop stops one token
         # early would otherwise match nothing and escape the check entirely.
-        cap, n_at_cap = (args.steps, counts.get(args.steps, 0)) if args.steps else (0, 0)
-        if not n_at_cap:
-            cap, n_at_cap = counts.most_common(1)[0]
+        cap, n_at_cap = counts.most_common(1)[0]
+        # Prefer the requested cap only when it explains at least as many requests
+        # as the measured one; a couple of requests ending exactly at STEPS must
+        # not hide a larger cap somewhere else.
+        if args.steps and counts.get(args.steps, 0) >= n_at_cap:
+            cap, n_at_cap = args.steps, counts[args.steps]
         longest = max(len(c) for c in comps)
         # cap 0 is not reachable (getp_eval.c floors steps<=0 at GETP_DEFAULT_STEPS),
         # so an engine emitting nothing is a real failure, not a misconfiguration.
-        if cap > 0 and n_at_cap >= max(2, 0.05 * len(comps)) and cap < longest:
+        # If STEPS is at least the longest reference, no cap can explain a short
+        # generation: the engine truncated on its own, which is a real defect and
+        # must reach the gate rather than be excused as a misconfiguration.
+        capped = (args.steps or 0) < longest
+        if capped and cap > 0 and n_at_cap >= max(2, thr["getp_bad_frac"] * len(comps)) \
+                and cap < longest:
             print_warnings()
             # exit 2 = "not graded", same as --quick; 1 is reserved for a real FAIL
             print(f"\n  RESULT: not graded -- {n_at_cap}/{len(comps)} generations "
@@ -281,9 +298,14 @@ def score_tokens(args, model_dir, comps, thr):
                   f"  That is a generation cap, not an engine defect: re-run with "
                   f"STEPS >= {longest}.", flush=True)
             sys.exit(2)
-        warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
-             f"reference; if STEPS caps generation below the reference length "
-             f"(max {max(len(c) for c in comps)}), the gate will fail a correct engine")
+        if capped:
+            warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
+                 f"reference; if STEPS caps generation below the reference length "
+                 f"(max {longest}), the gate will fail a correct engine")
+        else:
+            warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
+                 f"reference, and STEPS={args.steps} cannot be the cause (>= the "
+                 f"longest reference, {longest}) -- the engine stopped early itself")
 
     if args.quick:
         return None                      # nothing was gated
@@ -302,7 +324,12 @@ def main():
     comps = read_id_lines(os.path.join(data, "completions.i32.txt"))
     recs = ref["requests"]
     n = len(recs)
-    assert len(prompts) == len(comps) == n, "dataset length mismatch"
+    # Not an assert: `python -O` would drop it and zip() would then hide the
+    # difference silently. A malformed dataset is a misconfiguration, not a FAIL.
+    if not (len(prompts) == len(comps) == n):
+        print(f"dataset {data} is inconsistent: {len(prompts)} prompts, "
+              f"{len(comps)} completions, {n} reference records", file=sys.stderr)
+        sys.exit(2)
     check_dataset_model(args, ref, data)
 
     if args.tokens:
@@ -317,6 +344,7 @@ def main():
         sys.exit(0 if ok else 1)
 
     if not os.path.exists(args.run):
+        print_warnings()
         print(f"C run binary not found: {args.run} (build with `make run`)",
               file=sys.stderr)
         sys.exit(3)                      # environment fault, not a gate failure
@@ -386,6 +414,7 @@ def score_fuzzy(model_dir, pred_ids, ref_ids, thr):
     try:
         import evaluate  # noqa
     except ModuleNotFoundError:
+        print_warnings()
         print("the accuracy tier needs the `fuzzy` extra: `uv sync --extra fuzzy`",
               file=sys.stderr)
         sys.exit(3)
@@ -394,6 +423,7 @@ def score_fuzzy(model_dir, pred_ids, ref_ids, thr):
     try:
         tok = AutoTokenizer.from_pretrained(model_dir)
     except Exception as e:
+        print_warnings()
         print(f"could not load the tokenizer for '{model_dir}' "
               f"({type(e).__name__}: {e})\n  If this machine is offline or the "
               f"caches are cold, {_WARM}.", file=sys.stderr)
@@ -403,6 +433,7 @@ def score_fuzzy(model_dir, pred_ids, ref_ids, thr):
     try:
         meteor = evaluate.load("meteor").compute(predictions=preds, references=refs)["meteor"]
     except Exception as e:
+        print_warnings()
         print(f"could not load or run the METEOR metric ({type(e).__name__}: {e})\n"
               f"  If this machine is offline or the caches are cold, {_WARM}.",
               file=sys.stderr)
@@ -418,6 +449,7 @@ def score_fuzzy(model_dir, pred_ids, ref_ids, thr):
                 predictions=[preds[i] for i in live],
                 references=[refs[i] for i in live], lang="en")
         except Exception as e:
+            print_warnings()
             print(f"could not load or run BERTScore ({type(e).__name__}: {e})\n"
                   f"  If this machine is offline or the caches are cold, {_WARM}.",
                   file=sys.stderr)
