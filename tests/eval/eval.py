@@ -17,7 +17,9 @@ A. DEFAULT -- drives the C `run` binary through its single-sequence eval modes:
   and BOTH gate on top1_strict. Measured on the frozen CPU build (2026-08-14,
   dsv2lite, full 5-request dev set): decode 100.000% (160/160), prefill 100.000%
   (160/160 -- both paths report the same NUMBER of scored rows, enforced per
-  request; the position values themselves are not compared),
+  request; the position values themselves are not compared), worst ppl rel-err
+  2.695e-05. Same run on glm47: decode 100.000% (160/160), prefill 100.000%
+  (160/160), worst ppl rel-err 3.030e-05, ppl token-count mismatch 0/5.
   worst ppl rel-err 2.695e-05. The 0.99 threshold was calibrated against the
   decode kernel; that run is the evidence for applying it to the prefill kernel
   too, which uses a different forward and accumulates different rounding.
@@ -60,6 +62,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -212,11 +215,23 @@ _MAX_SEQ = 4096
 
 
 _KV_CACHE_CAP = 163840     # src/model_load.c KV_CACHE_CAP
-# gen_reference.py owns this ceiling; read it from there so the two cannot drift.
-try:
-    from gen_reference import _RUN_C_MAX_IDS
-except ImportError:                        # not importable (torch absent): mirror
-    _RUN_C_MAX_IDS = 4096
+def _read_const(path, name, default):
+    """Read `name = <int>` out of a sibling script without importing it.
+
+    gen_reference.py owns _RUN_C_MAX_IDS, but importing it would pull torch and
+    the oracle manifest into every eval run (~4s and a hard dependency chain for
+    one integer). The Makefile reads GETP_DEFAULT_STEPS out of the C source the
+    same way.
+    """
+    try:
+        with open(os.path.join(_HERE, path)) as f:
+            m = re.search(rf"^{name}\s*=\s*(\d+)", f.read(), re.M)
+        return int(m.group(1)) if m else default
+    except OSError:
+        return default
+
+
+_RUN_C_MAX_IDS = _read_const("gen_reference.py", "_RUN_C_MAX_IDS", 4096)
 
 
 def _kv_capacity(model_dir):
