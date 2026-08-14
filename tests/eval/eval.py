@@ -32,6 +32,10 @@ B. --tokens FILE -- scores a generated-token-ids file (one line of space-separat
 
 Thresholds for both come from threshold.json.
 
+Exit codes: 0 = ok, 1 = the gate failed, 2 = not graded (nothing was scored),
+3 = environment fault (missing deps, cold cache, no network). A grading script
+must not record 3 as a candidate failure.
+
 Options:
   -r, --run PATH   C run binary (default <repo>/run)
   --tokens PATH    score this generated-ids file instead of driving `run`
@@ -63,6 +67,10 @@ def parse_args():
     p.add_argument("--model-dir", default=None,
                    help="override the model dir (reference.json's is provenance; "
                         "its absolute path won't exist on another machine)")
+    p.add_argument("--steps", type=int, default=None,
+                   help="--tokens: the STEPS the run requested, so a generation "
+                        "capped below the reference length is reported as a "
+                        "misconfiguration rather than graded as a failure")
     p.add_argument("--quick", action="store_true",
                    help="--tokens: print the prefix diagnostics and skip the accuracy "
                         "tier (heavy deps). Grades nothing; exits 2.")
@@ -137,6 +145,13 @@ _WARNINGS = []
 def warn(msg):
     _WARNINGS.append(msg)
     print(f"  WARNING: {msg}", flush=True)
+
+
+def print_warnings():
+    """Re-print next to the verdict. Must run before EVERY exit path, including
+    the early ones -- a warning 500 lines up is a warning nobody reads."""
+    for w in _WARNINGS:
+        print(f"  WARNING: {w}")
 
 
 def check_dataset_model(args, ref, data):
@@ -239,15 +254,24 @@ def score_tokens(args, model_dir, comps, thr):
         # Every short generation the same length is a hard cap (STEPS below the
         # reference length), not an engine defect. Grading that would report FAIL
         # for a correct engine, so refuse to grade instead of scoring it.
-        caps = {len(gen[i]) for i in short}
-        if len(caps) == 1 and len(short) >= max(2, 0.05 * len(comps)):
-            cap = caps.pop()
+        # An engine that stops on EOS gives mixed short lengths, so "all equal"
+        # was too strict -- one early stop let a capped run through to a FAIL.
+        # Prefer the cap the caller actually asked for; fall back to the most
+        # common short length when --steps was not passed.
+        from collections import Counter
+        if args.steps:
+            cap, n_at_cap = args.steps, sum(1 for i in short if len(gen[i]) == args.steps)
+        else:
+            cap, n_at_cap = Counter(len(gen[i]) for i in short).most_common(1)[0]
+        longest = max(len(c) for c in comps)
+        if n_at_cap >= max(2, 0.05 * len(comps)) and cap < longest:
+            print_warnings()
             # exit 2 = "not graded", same as --quick; 1 is reserved for a real FAIL
-            print(f"\n  RESULT: not graded -- {len(short)}/{len(comps)} generations "
+            print(f"\n  RESULT: not graded -- {n_at_cap}/{len(comps)} generations "
                   f"stop at exactly {cap} tokens, below the reference "
-                  f"(max {max(len(c) for c in comps)}).\n"
+                  f"(max {longest}).\n"
                   f"  That is a generation cap, not an engine defect: re-run with "
-                  f"STEPS >= {max(len(c) for c in comps)}.", flush=True)
+                  f"STEPS >= {longest}.", flush=True)
             sys.exit(2)
         warn(f"{len(short)}/{len(comps)} requests generated fewer tokens than the "
              f"reference; if STEPS caps generation below the reference length "
@@ -277,8 +301,7 @@ def main():
         print(f"[{args.model}] {args.tokens}  ({n} requests)", flush=True)
         ok = score_tokens(args, model_dir, comps, thr)
         print()
-        for w in _WARNINGS:
-            print(f"  WARNING: {w}")
+        print_warnings()
         if ok is None:      # --quick: diagnostics only, so say so rather than pass
             print("  RESULT: not graded (--quick skipped the accuracy gate)")
             sys.exit(2)
@@ -338,6 +361,7 @@ def main():
         ok = run_fuzzy(args, model_dir, prompts, comps, recs, thr) and ok
 
     print()
+    print_warnings()
     print("  RESULT:", "ok" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
@@ -352,15 +376,27 @@ def score_fuzzy(model_dir, pred_ids, ref_ids, thr):
     try:
         import evaluate  # noqa
     except ModuleNotFoundError:
-        sys.exit("the accuracy tier needs the `fuzzy` extra: `uv sync --extra fuzzy`")
-    tok = AutoTokenizer.from_pretrained(model_dir)
+        print("the accuracy tier needs the `fuzzy` extra: `uv sync --extra fuzzy`",
+              file=sys.stderr)
+        sys.exit(3)
+    # model_dir may be a Hub repo id (the published reference.json records one),
+    # so this load can hit the network too -- same guard, same hint.
+    try:
+        tok = AutoTokenizer.from_pretrained(model_dir)
+    except Exception as e:
+        print(f"could not load the tokenizer for '{model_dir}' "
+              f"({type(e).__name__}: {e})\n  If this machine is offline or the "
+              f"caches are cold, {_WARM}.", file=sys.stderr)
+        sys.exit(3)
     preds = [tok.decode(ids) for ids in pred_ids]
     refs = [tok.decode(ids) for ids in ref_ids]
     try:
         meteor = evaluate.load("meteor").compute(predictions=preds, references=refs)["meteor"]
     except Exception as e:
-        sys.exit(f"could not load or run the METEOR metric ({type(e).__name__}: {e})\n"
-                 f"  If this machine is offline or the caches are cold, {_WARM}.")
+        print(f"could not load or run the METEOR metric ({type(e).__name__}: {e})\n"
+              f"  If this machine is offline or the caches are cold, {_WARM}.",
+              file=sys.stderr)
+        sys.exit(3)
     # BERTScore's tokenizer raises on an empty/whitespace-only prediction, which a
     # request that generated nothing produces. Score those 0 (maximally wrong) and
     # keep them out of the compute call, rather than crashing the gate.
@@ -372,8 +408,10 @@ def score_fuzzy(model_dir, pred_ids, ref_ids, thr):
                 predictions=[preds[i] for i in live],
                 references=[refs[i] for i in live], lang="en")
         except Exception as e:
-            sys.exit(f"could not load or run BERTScore ({type(e).__name__}: {e})\n"
-                     f"  If this machine is offline or the caches are cold, {_WARM}.")
+            print(f"could not load or run BERTScore ({type(e).__name__}: {e})\n"
+                  f"  If this machine is offline or the caches are cold, {_WARM}.",
+                  file=sys.stderr)
+            sys.exit(3)
         for i, v in zip(live, bs["f1"]):
             f1s[i] = v
     f1 = sum(f1s) / len(f1s)
