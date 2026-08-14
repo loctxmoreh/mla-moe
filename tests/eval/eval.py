@@ -79,6 +79,12 @@ def parse_args():
     p.add_argument("--fuzzy", action="store_true")
     p.add_argument("--max-new", type=int, default=None)
     args = p.parse_args()
+    # Both belong to --tokens. Path A ignores them, so a command line that lost
+    # its --tokens would otherwise print path A's verdict and a grading script
+    # would read it as the getp verdict.
+    for opt, val in (("--quick", args.quick), ("--steps", args.steps is not None)):
+        if val and args.tokens is None:
+            p.error(f"{opt} requires --tokens")
     if args.steps is not None and args.steps < 1:
         # getp_eval.c raises steps<=0 to GETP_DEFAULT_STEPS, so the hint would
         # describe a run that never happened.
