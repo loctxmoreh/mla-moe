@@ -212,7 +212,11 @@ _MAX_SEQ = 4096
 
 
 _KV_CACHE_CAP = 163840     # src/model_load.c KV_CACHE_CAP
-_RUN_C_MAX_IDS = 4096      # gen_reference.py's own --max-tokens ceiling
+# gen_reference.py owns this ceiling; read it from there so the two cannot drift.
+try:
+    from gen_reference import _RUN_C_MAX_IDS
+except ImportError:                        # not importable (torch absent): mirror
+    _RUN_C_MAX_IDS = 4096
 
 
 def _kv_capacity(model_dir):
@@ -525,7 +529,15 @@ def main():
             # runs a one-token sequence, so that case belongs to the too_long
             # test below, which names the dataset instead.
             print_warnings()
-            if kv_shown is not None and not (-2**31 <= kv_shown < 2**31):
+            if kv_shown is not None and kv_shown != kv_shown:
+                why = ("holds max_position_embeddings NaN, which is not valid "
+                       "JSON: cJSON_Parse fails and src/model_load.c exits at "
+                       "the parse")
+            elif kv_shown is not None and abs(kv_shown) == math.inf:
+                why = (f"holds max_position_embeddings {kv_shown}, which is not "
+                       f"valid JSON: cJSON_Parse fails and src/model_load.c exits "
+                       f"at the parse")
+            elif kv_shown is not None and not (-2**31 <= kv_shown < 2**31):
                 why = (f"holds a max_position_embeddings ({kv_shown}) that "
                        f"src/model_load.c cannot represent (cfg_int casts it to "
                        f"a C int)")
@@ -556,7 +568,8 @@ def main():
                       else "use a model with a larger max_position_embeddings")
             longest = need - 2               # the longest prompt itself
             if cap >= need:
-                fix = "regenerate the dataset with a smaller --max-tokens"
+                fix = (f"regenerate the dataset with --max-tokens {cap} or less "
+                       f"(the longest prompt is {longest} tokens)")
             elif cap == longest + 1 and need <= _RUN_C_MAX_IDS:
                 # A 1-token completion still fits, but gen_reference needs two
                 # free positions above the prompt -- and it refuses a
@@ -565,11 +578,16 @@ def main():
                        f"longest prompt is {longest} tokens, so only a 1-token "
                        f"completion fits under {cap})")
             elif cap >= longest:
-                # The prompt itself fits; what does not fit is the completion
-                # plus the 2 free positions gen_reference.py requires.
-                fix = (f"no flags help: the longest prompt is {longest} tokens, and "
-                       f"gen_reference.py needs 2 free positions above it -- "
-                       f"{raise_}, or shorten the prompts")
+                # The prompt fits; the blocker is gen_reference.py's own rule that
+                # every prompt keeps 2 free positions, and (when `need` is over
+                # the generator's ceiling) that ceiling. Naming the engine limits
+                # here would send the operator to the wrong knob.
+                blocker = ("gen_reference.py needs 2 free positions above it, and "
+                           f"its --max-tokens ceiling is {_RUN_C_MAX_IDS}"
+                           if need > _RUN_C_MAX_IDS else
+                           "gen_reference.py needs 2 free positions above it")
+                fix = (f"no flags help: the longest prompt is {longest} tokens and "
+                       f"{blocker} -- shorten the prompts, or {raise_}")
             else:
                 fix = (f"no flags help: the longest prompt is {longest} tokens and "
                        f"does not fit under {cap} on its own -- {raise_}, or "
