@@ -177,6 +177,11 @@ def check_dataset_model(args, ref, data):
     # model_dir is provenance -- the weight-directory name on the machine that
     # generated the set -- so a rename there must not block a consistent dataset.
     # Heuristic, therefore a warning; the authoritative check above stays fatal.
+    # Note this branch cannot fire for either real dataset kind: the in-repo dev
+    # sets carry "model" in reference.json and the published set carries it in
+    # manifest.json, so `stated` is always set. It is a last resort for a
+    # hand-made directory holding reference.json alone -- do not rely on it to
+    # catch a wrong MODEL.
     ref_dir = os.path.basename(str(ref.get("model_dir", "")).rstrip("/")).lower()
     hint = _MODEL_HINT.get(args.model)
     if ref_dir and hint and hint not in ref_dir and not stated:
