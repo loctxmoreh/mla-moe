@@ -165,7 +165,9 @@ getp: $(GETP_DEPS)
 # this file holds no copy of the number.
 # The gate is the announced accuracy gate (METEOR + BERTScore-F1); prefix agreement
 # prints as a diagnostic and does not decide the verdict, because a bf16/fp8 engine
-# legitimately diverges from the fp32 reference. QUICK=1 skips the accuracy tier and
+# legitimately diverges from the fp32 reference. (The 0.90 BERTScore limit still gives
+# the gate a partial prefix-agreement effect -- see the README accuracy-gate paragraph.)
+# QUICK=1 skips the accuracy tier and
 # its heavy deps, printing diagnostics only (exit 2 -- it grades nothing).
 getp-eval: $(GETP_DEPS)
 	@test -n "$(RUN)" -a -x "$(RUN_BIN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }

@@ -390,6 +390,17 @@ def main():
     if not isinstance(thr, dict):
         print(f"{args.thresholds} does not hold a JSON object", file=sys.stderr)
         sys.exit(2)
+    if not isinstance(recs, list):
+        print(f"{data}/reference.json: 'requests' is not a list", file=sys.stderr)
+        sys.exit(2)
+    # Checked here, not at first use: the ppl read happens after the engine has
+    # already run request 0, so a malformed record would cost a timed pass first.
+    bad = [i for i, r in enumerate(recs)
+           if not isinstance(r, dict) or "hf_nll" not in r or not r.get("hf_ntok")]
+    if bad:
+        print(f"{data}/reference.json: record(s) {bad[:8]} miss a usable "
+              f"'hf_nll'/'hf_ntok' pair", file=sys.stderr)
+        sys.exit(2)
     missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
                            "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
     if missing:
@@ -425,6 +436,10 @@ def main():
         print("  RESULT:", "ok" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
+    if not args.run:
+        print_warnings()
+        print("--run needs a path; an empty value names no binary", file=sys.stderr)
+        sys.exit(3)                      # environment fault, not a gate failure
     # A bare word goes to PATH in execvp but to the working directory in
     # os.access, so the guard and the launch would test different files. The
     # Makefile makes the same correction for RUN.
@@ -566,6 +581,14 @@ def run_fuzzy(args, model_dir, prompts, comps, recs, thr):
     """Free-run greedy generation vs golden completion, scored METEOR+BERTScore."""
     preds = []
     for pids, rec in zip(prompts, recs):
+        # Guarded here rather than in the up-front record check: completion_len is
+        # only needed by --fuzzy, so a dataset without it still serves every other
+        # path. --max-new overrides it entirely.
+        if not args.max_new and not isinstance(rec.get("completion_len"), int):
+            print_warnings()
+            print(f"reference.json record has no usable 'completion_len' and no "
+                  f"--max-new was given", file=sys.stderr)
+            sys.exit(2)
         max_new = args.max_new or rec["completion_len"]
         out = run_c(args.run, model_dir, pids, "gen", max_new)
         gen_ids = []
