@@ -213,7 +213,9 @@ def _kv_capacity(model_dir):
 
     cfg_int() takes the default unless the value is a JSON number, so a numeric
     *string* must not be accepted here either -- int("2048") would make the two
-    disagree. A value below 2 is not a cache length and takes the fallback too.
+    disagree. A number below 2 IS kept, because C keeps it: the caller refuses
+    such a model rather than silently grading against a cache the engine cannot
+    allocate.
     """
     try:
         with open(os.path.join(model_dir, "config.json")) as f:
@@ -223,8 +225,7 @@ def _kv_capacity(model_dir):
         maxpos = cfg.get("max_position_embeddings", _KV_CACHE_CAP)
         if isinstance(maxpos, bool) or not isinstance(maxpos, (int, float)):
             return _MAX_SEQ              # cfg_int() would take the default
-        maxpos = int(maxpos)
-        return min(maxpos, _KV_CACHE_CAP) if maxpos >= 2 else _MAX_SEQ
+        return min(int(maxpos), _KV_CACHE_CAP)
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         return _MAX_SEQ
 
@@ -496,6 +497,14 @@ def main():
         # disagree), and teacher/ppl both hand the whole sequence to
         # forward_unabsorbed, which writes kv_l[p * KVD] for every position.
         cap = min(_MAX_SEQ, _kv_capacity(model_dir))
+        if cap < 2:
+            # model_load.c keeps a number below 2, so kv_cache is calloc(0) and
+            # every layer writes past a zero-size block. Refuse the model rather
+            # than grade against it, and say which file is at fault.
+            print_warnings()
+            print(f"{model_dir}/config.json gives a KV cache length of {cap}: the "
+                  f"engine cannot load this model", file=sys.stderr)
+            sys.exit(3)                  # environment fault, not a gate failure
         too_long = [i for i, (p, c) in enumerate(zip(prompts, comps))
                     if len(p) + len(c) > cap]
         if too_long:
