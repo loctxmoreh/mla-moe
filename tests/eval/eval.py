@@ -95,6 +95,9 @@ def parse_args():
     for opt, val in (("--max-new", args.max_new is not None), ("--fuzzy", args.fuzzy)):
         if val and args.tokens is not None:
             p.error(f"{opt} does not apply with --tokens")
+    # ...and --max-new is read only by run_fuzzy, so without --fuzzy it is inert.
+    if args.max_new is not None and not args.fuzzy:
+        p.error("--max-new requires --fuzzy")
     if args.max_new is not None and args.max_new < 1:
         p.error("--max-new must be >= 1")
     if args.steps is not None and args.steps < 1:
@@ -199,6 +202,16 @@ def _ppl(nll, ntok):
 # truncated there, which shows up as a ppl token-count mismatch and would
 # otherwise be reported as an engine defect.
 _MAX_SEQ = 4096
+
+
+def _kv_capacity(model_dir):
+    """max_seq_len as src/model_load.c computes it: min(max_position_embeddings,
+    KV_CACHE_CAP). Falls back to _MAX_SEQ when the config cannot be read."""
+    try:
+        cfg = json.load(open(os.path.join(model_dir, "config.json")))
+        return min(int(cfg.get("max_position_embeddings", 163840)), 163840)
+    except (OSError, ValueError, TypeError):
+        return _MAX_SEQ
 
 
 def _usable_len(rec):
@@ -501,12 +514,18 @@ def main():
             # `gen` mode in src/run.c raises pos once per step and tests nothing,
             # so an oversized length writes past the end of the KV cache. bench
             # mode has this test; gen mode does not.
+            # The write bound is the KV cache, sized from the model config, not
+            # the id-read limit; they coincide for the exam models but not by
+            # construction. Take whichever is smaller.
+            cap = min(_MAX_SEQ, _kv_capacity(model_dir))
             over = [i for i, (p, r) in enumerate(zip(prompts, recs))
-                    if len(p) + (args.max_new or int(r["completion_len"])) > _MAX_SEQ]
+                    if len(p) + (args.max_new or int(r["completion_len"])) > cap]
             if over:
+                cause = ("--max-new" if args.max_new
+                         else f"'completion_len' in {data}/reference.json")
                 print_warnings()
-                print(f"prompt + generation exceeds the {_MAX_SEQ}-token buffer for "
-                      f"request(s) {over[:8]} -- lower --max-new", file=sys.stderr)
+                print(f"prompt + generation exceeds the {cap}-token buffer for "
+                      f"request(s) {over[:8]} -- lower {cause}", file=sys.stderr)
                 sys.exit(2)
     missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
                            "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
@@ -552,7 +571,7 @@ def main():
           + (f"  meteor>={thr['meteor']}  bertscore_f1>={thr['bertscore_f1']}" if args.fuzzy else ""),
           flush=True)
 
-    tot = {"P_ok": 0, "D_ok": 0, "cmp": 0}          # top-1 aggregates
+    tot = {"P_ok": 0, "D_ok": 0, "cmp": 0, "P_cmp": 0}   # top-1 aggregates
     worst_ppl = 0.0
     all_misses = []
     nonfinite, mismatched = [], []
@@ -595,9 +614,11 @@ def main():
         worst_ppl = max(worst_ppl, rel)
         if sd:
             tot["D_ok"] += round(sd[0] * sd[2]); tot["cmp"] += sd[2]
-            all_misses += [(i, *m) for m in sd[3]]
+            all_misses += [(i, "D", *m) for m in sd[3]]
         if sp:
-            tot["P_ok"] += round(sp[0] * sp[2])
+            all_misses += [(i, "P", *m) for m in sp[3]]
+        if sp:
+            tot["P_ok"] += round(sp[0] * sp[2]); tot["P_cmp"] += sp[2]
         print(f"  [{i}] comp={sd[2] if sd else 0:4d}  "
               f"P_top1={sp[0]*100:6.2f}% (tie {sp[1]*100:6.2f}%)  "
               f"D_top1={sd[0]*100:6.2f}% (tie {sd[1]*100:6.2f}%)  "
@@ -611,6 +632,15 @@ def main():
         warn(f"{len(mismatched)}/{n} request(s) scored a different number of ppl "
              f"targets than the reference (e.g. request {i}: {got} vs {want}) -- the "
              f"two perplexities are not comparable")
+    if tot["P_cmp"] != tot["cmp"]:
+        # Equal counts are a property of the frozen run.c teacher mode, and
+        # p_strict divides by the decode count. A build that prints a different
+        # number of P rows is the same class as one that prints none: exit 3.
+        print_warnings()
+        print(f"{args.run} printed {tot['P_cmp']} prefill rows against "
+              f"{tot['cmp']} decode rows over the completion region -- the two "
+              f"top-1 numbers are not comparable", file=sys.stderr)
+        sys.exit(3)                      # environment fault, not a gate failure
     cmp = tot["cmp"] or 1
     d_strict = tot["D_ok"] / cmp
     p_strict = tot["P_ok"] / cmp
@@ -620,9 +650,9 @@ def main():
     print(f"  worst ppl rel-err        = {worst_ppl:.3e}")
     print(f"  ppl token-count mismatch = {len(mismatched)}/{n}")
     if all_misses:
-        print(f"  decode misses (pos, gold, argmax, gap), worst first:")
-        for req, pos, gold, am, gap in sorted(all_misses, key=lambda m: -m[4])[:10]:
-            print(f"    req{req} pos{pos}: gold {gold} != argmax {am}  gap={gap:.4f}"
+        print(f"  misses (path, pos, gold, argmax, gap), worst first:")
+        for req, path, pos, gold, am, gap in sorted(all_misses, key=lambda m: -m[5])[:10]:
+            print(f"    req{req} {path} pos{pos}: gold {gold} != argmax {am}  gap={gap:.4f}"
                   + ("  [tie]" if gap <= args.tie else ""))
 
     # Both paths gate: a prefill number printed beside RESULT: ok while reaching

@@ -48,8 +48,11 @@ def parse_args():
     args = p.parse_args()
     # src/run.c reads at most 4096 ids, and tests/eval/eval.py refuses a dataset
     # that exceeds it. A larger value here would freeze a set no run can grade.
-    if args.max_tokens > 4096:
-        p.error("--max-tokens above 4096 exceeds the read limit in src/run.c")
+    if not 2 <= args.max_tokens <= 4096:
+        p.error("--max-tokens must be in [2, 4096] (4096 is the read limit in "
+                "src/run.c; below 2 no prompt fits)")
+    if args.max_new < 1:
+        p.error("--max-new must be >= 1")
     return args
 
 
