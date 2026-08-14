@@ -18,7 +18,9 @@ one readable C codebase where every operation is explicit and auditable.
   (numpy, safetensors, transformers, accelerate, torch-cpu) — run this once
   before any `uv run python ...` command below. The METEOR/BERTScore accuracy
   tier needs the `fuzzy` extra (`uv sync --extra fuzzy`); `make getp-eval` and
-  `make eval FUZZY=1` pull it in for you.
+  `make eval FUZZY=1` pull it in for you. That tier also downloads metric scripts,
+  nltk data and roberta-large on first use — run `make eval-warm` once on a
+  networked machine to fill the caches, after which `HF_HUB_OFFLINE=1` works.
 - **Model weights**: checkpoints are plain HF directories (`config.json` +
   `model.safetensors.index.json` + shards), mmap'd directly — no download or
   conversion step. On the shared cluster they live at
@@ -189,12 +191,14 @@ Grading uses a held-out private set of the same shape, so tune against the publi
 one, not against individual prompts:
 
 ```sh
-make eval-fetch      # -> tests/eval/public/{dsv2lite,glm47}
-make getp-eval MODEL=dsv2lite DATA=tests/eval/public/dsv2lite MODELDIR="$DSV" STEPS=64
+make eval-fetch      # -> tests/eval/fetched/mla-moe-dataset-public/{dsv2lite,glm47}
+make getp-eval MODEL=dsv2lite MODELDIR="$DSV" STEPS=64 \
+  DATA=tests/eval/fetched/mla-moe-dataset-public/dsv2lite
 ```
 
 `DATA` selects the dataset dir for `eval`/`getp`/`getp-eval`; it defaults to the
-small in-repo dev set, which is for smoke-testing, not for tuning.
+small in-repo dev set, which is for smoke-testing, not for tuning. The fetch
+directory is named after the set, so two sets never overwrite each other.
 
 `getp` mode runs a fixed request set (`requests.txt`: line 0 = count, then one
 prompt per line) through your `inference()` and prints one end-to-end number —

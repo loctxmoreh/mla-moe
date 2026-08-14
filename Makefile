@@ -41,7 +41,7 @@ RUN_C_OBJS = $(RUN_C_SRCS:.c=.o)
 HIP_OBJS   = $(HIP_SRCS:.hip=.o)
 TOOL_SRCS  = $(LIB_SRCS) src/main.c
 
-.PHONY: all clean tok-cli eval eval-gen eval-fetch ref-binary bench getp getp-eval
+.PHONY: all clean tok-cli eval eval-gen eval-fetch eval-warm ref-binary bench getp getp-eval
 
 all: run mla-moe
 
@@ -61,15 +61,29 @@ DATA ?= tests/eval/$(MODEL)
 # Fetch the participant-facing 512-prompt set from the Hub into tests/eval/public/
 # (gitignored — it is a published artifact, not repo state). Same file layout as
 # the in-repo dev set, so every target below takes it via DATA=.
+# The fetch dir is derived from the set name, so a private set never lands on top
+# of the public one -- the path on disk always says which set it holds.
 PUBLIC_SET ?= thanhnx12/mla-moe-dataset-public
+FETCH_DIR   = tests/eval/fetched/$(notdir $(PUBLIC_SET))
 eval-fetch:
-	@for m in dsv2lite glm47; do mkdir -p tests/eval/public/$$m; \
+	@for m in dsv2lite glm47; do mkdir -p $(FETCH_DIR)/$$m; \
 	  for f in requests.txt prompts.i32.txt completions.i32.txt reference.json manifest.json; do \
-	    curl -sSLf -o tests/eval/public/$$m/$$f \
+	    curl -sSLf -o $(FETCH_DIR)/$$m/$$f \
 	      "https://huggingface.co/datasets/$(PUBLIC_SET)/resolve/main/$$m/$$f" \
 	      || { echo "fetch failed: $$m/$$f"; exit 1; }; \
 	  done; done
-	@echo "fetched $(PUBLIC_SET) -> tests/eval/public/ (use DATA=tests/eval/public/<model>)"
+	@echo "fetched $(PUBLIC_SET) (split: $$(sed -n 's/.*\"split\": *\"\([^\"]*\)\".*/\1/p' \
+	  $(FETCH_DIR)/dsv2lite/manifest.json)) -> $(FETCH_DIR)/"
+	@echo "use DATA=$(FETCH_DIR)/<model>"
+
+# Pre-fill the Hub and nltk caches that the accuracy tier needs (metric scripts,
+# roberta-large, wordnet/punkt). Run once on a machine that has network; grading
+# can then run with HF_HUB_OFFLINE=1. Without this the gate needs the network.
+eval-warm:
+	uv run --extra fuzzy python -c "import evaluate; \
+	  evaluate.load('meteor').compute(predictions=['a b c'], references=['a b d']); \
+	  evaluate.load('bertscore').compute(predictions=['a b c'], references=['a b d'], \
+	    lang='en', rescale_with_baseline=True); print('accuracy-tier caches warm')"
 
 # Score the C engine against the frozen dataset: teacher-forced top-1 (both
 # paths) + perplexity rel-err. Add FUZZY=1 for the METEOR/BERTScore free-run tier.
@@ -93,11 +107,18 @@ bench: run
 # MODEL selects tests/eval/<MODEL>/requests.txt; MODELDIR points at the weights
 # (defaults to $DSV / $GLM per model). Override STEPS/OUT as needed.
 MODELDIR ?= $(if $(filter glm47,$(MODEL)),$(GLM),$(DSV))
-GETP_OUT  = $(if $(OUT),$(OUT),/tmp/getp_$(MODEL).txt)
+# Output path is per (model, dataset) and inside the tree, not a fixed /tmp name:
+# a shared machine gives EACCES on another user's file, and two runs of one user
+# would otherwise overwrite the ids that getp-eval then grades.
+GETP_OUT  = $(if $(OUT),$(OUT),$(CURDIR)/getp_$(MODEL)_$(subst /,_,$(DATA)).txt)
 # RUN points at the engine binary, so a grader can score a submitted or
 # alternately-built binary (RUN=./run-ref, RUN=./submission) with these targets.
+# Building the working tree is only a prerequisite when RUN is that build: a
+# submitted binary must be gradeable on a tree that does not compile.
 RUN      ?= ./run
-getp: run
+GETP_DEPS = $(if $(filter ./run,$(RUN)),run,)
+getp: $(GETP_DEPS)
+	@test -x "$(RUN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
 	"$(RUN)" "$(MODELDIR)" getp $(DATA)/requests.txt \
 	  $(GETP_OUT) $(if $(STEPS),$(STEPS),)
@@ -111,7 +132,8 @@ getp: run
 # prints as a diagnostic and does not decide the verdict, because a bf16/fp8 engine
 # legitimately diverges from the fp32 reference. QUICK=1 skips the accuracy tier and
 # its heavy deps, printing diagnostics only (exit 2 -- it grades nothing).
-getp-eval: run
+getp-eval: $(GETP_DEPS)
+	@test -x "$(RUN)" || { echo "no engine binary at RUN=$(RUN)"; exit 1; }
 	@test -n "$(MODELDIR)" || { echo "set MODELDIR=<model_dir> (or DSV=/GLM=)"; exit 1; }
 	"$(RUN)" "$(MODELDIR)" getp $(DATA)/requests.txt \
 	  $(GETP_OUT) $(if $(STEPS),$(STEPS),)

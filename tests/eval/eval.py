@@ -125,6 +125,37 @@ def parse_ppl(out):
     return c_nll, c_ntok
 
 
+_MODEL_HINT = {"dsv2lite": "deepseek", "glm47": "glm"}
+
+
+def check_dataset_model(args, ref, data):
+    """Fail fast when MODEL, DATA and --model-dir do not describe the same model.
+
+    They are independent variables in the Makefile, so `MODEL=glm47
+    DATA=<dsv2lite dir>` silently scores GLM output against DeepSeek ids with the
+    GLM tokenizer and reports a plain FAIL. Not every dataset carries the same
+    provenance keys -- the in-repo dev sets have "model", the published set has
+    only "model_dir" and a manifest -- so cross-check whatever is present.
+    """
+    stated = ref.get("model")
+    if stated is None:
+        man = os.path.join(data, "manifest.json")
+        if os.path.exists(man):
+            stated = json.load(open(man)).get("model")
+    if stated and stated != args.model:
+        sys.exit(f"dataset {data} is for model '{stated}', but MODEL={args.model}")
+
+    ref_dir = os.path.basename(str(ref.get("model_dir", "")).rstrip("/")).lower()
+    if ref_dir and _MODEL_HINT[args.model] not in ref_dir:
+        sys.exit(f"dataset {data} was generated from '{ref['model_dir']}', "
+                 f"which is not a {args.model} model")
+    if args.model_dir and ref_dir:
+        got = os.path.basename(args.model_dir.rstrip("/")).lower()
+        if got != ref_dir:
+            print(f"  WARNING: --model-dir is '{got}' but the dataset was generated "
+                  f"from '{ref_dir}'", flush=True)
+
+
 def common_prefix(a, b):
     n = 0
     for x, y in zip(a, b):
@@ -199,6 +230,7 @@ def main():
     recs = ref["requests"]
     n = len(recs)
     assert len(prompts) == len(comps) == n, "dataset length mismatch"
+    check_dataset_model(args, ref, data)
 
     if args.tokens:
         print(f"[{args.model}] {args.tokens}  ({n} requests)", flush=True)

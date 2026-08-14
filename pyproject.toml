@@ -11,9 +11,10 @@ dependencies = [
     "torch>=2.12",
 ]
 
-# The eval's METEOR/BERTScore tier only (`make eval FUZZY=1`, `make getp-eval
-# FUZZY=1`). Kept out of the default install: it pulls datasets + a roberta-large
-# download, and the top-1/perplexity/prefix gates need none of it.
+# The eval's METEOR/BERTScore accuracy tier. `make getp-eval` always uses it (pass
+# QUICK=1 to skip it and get diagnostics only); `make eval` uses it under FUZZY=1.
+# Kept out of the default install: it pulls datasets + a roberta-large download,
+# and the teacher-forced top-1/perplexity path needs none of it.
 [project.optional-dependencies]
 fuzzy = [
     "evaluate>=0.4",
