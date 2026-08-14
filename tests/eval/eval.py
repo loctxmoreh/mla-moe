@@ -90,6 +90,11 @@ def parse_args():
     for opt, val in (("--quick", args.quick), ("--steps", args.steps is not None)):
         if val and args.tokens is None:
             p.error(f"{opt} requires --tokens")
+    # ...and the reverse: path B takes its lengths from the ids file, so these
+    # would be silently ignored there.
+    for opt, val in (("--max-new", args.max_new is not None), ("--fuzzy", args.fuzzy)):
+        if val and args.tokens is not None:
+            p.error(f"{opt} does not apply with --tokens")
     if args.max_new is not None and args.max_new < 1:
         p.error("--max-new must be >= 1")
     if args.steps is not None and args.steps < 1:
@@ -176,6 +181,18 @@ _WARNINGS = []
 def warn(msg):
     _WARNINGS.append(msg)
     print(f"  WARNING: {msg}", flush=True)
+
+
+# math.exp overflows above ~709.78; past that a perplexity is not representable.
+_EXP_MAX = 709.0
+
+
+def _ppl(nll, ntok):
+    """exp(nll/ntok), or inf when that overflows -- never raises."""
+    try:
+        return math.exp(nll / ntok)
+    except OverflowError:
+        return float("inf")
 
 
 def _usable_len(rec):
@@ -412,11 +429,17 @@ def main():
     # --fuzzy read would discard a complete top-1/ppl result. Only the fields THIS
     # run will actually read are required: --tokens reads neither pair.
     def _num(v):                          # finite real; bool subclasses int
+        # Compared, not converted: json.load builds unbounded ints, and both
+        # math.isfinite and float() raise OverflowError on one -- turning the
+        # value this test must reject into a traceback at exit 1.
         return (isinstance(v, (int, float)) and not isinstance(v, bool)
-                and math.isfinite(v))
+                and v == v and -math.inf < v < math.inf)
 
-    def _count(v):                        # a token count: whole number >= 1
-        return _num(v) and float(v).is_integer() and v >= 1
+    def _count(v):                        # a token count: whole number in [1, 1e9]
+        # Upper bound is not cosmetic: an unbounded int would overflow the
+        # ratio test below, which converts to float.
+        return (_num(v) and (isinstance(v, int) or v.is_integer())
+                and 1 <= v <= 10**9)
 
     if not args.model_dir and "model_dir" not in ref:
         print(f"{data}/reference.json has no 'model_dir': pass --model-dir",
@@ -438,11 +461,13 @@ def main():
         # ppl aggregate silently meaningless, so _num rejects them.
         bad = [i for i, r in enumerate(recs)
                if not isinstance(r, dict) or not _num(r.get("hf_nll"))
-               or r["hf_nll"] < 0 or not _count(r.get("hf_ntok"))]
+               or r["hf_nll"] < 0 or not _count(r.get("hf_ntok"))
+               or r["hf_nll"] / r["hf_ntok"] > _EXP_MAX]
         if bad:
             print_warnings()
             print(f"{data}/reference.json: record(s) {bad[:8]} miss a usable "
-                  f"'hf_nll' (finite, >= 0) / 'hf_ntok' (whole, >= 1) pair",
+                  f"'hf_nll' (finite, >= 0, mean <= {_EXP_MAX}) / 'hf_ntok' "
+                  f"(whole, >= 1) pair",
                   file=sys.stderr)
             sys.exit(2)
         if args.fuzzy and not args.max_new:      # run_fuzzy reads completion_len
@@ -455,6 +480,7 @@ def main():
     missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
                            "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
     if missing:
+        print_warnings()
         print(f"{args.thresholds} is missing required key(s): {', '.join(missing)}",
               file=sys.stderr)
         sys.exit(2)
@@ -497,6 +523,7 @@ def main():
     tot = {"P_ok": 0, "D_ok": 0, "cmp": 0}          # top-1 aggregates
     worst_ppl = 0.0
     all_misses = []
+    nonfinite, mismatched = [], []
     for i, (pids, cids, rec) in enumerate(zip(prompts, comps, recs)):
         full = pids + cids
         plen = len(pids)
@@ -513,20 +540,25 @@ def main():
             sys.exit(3)                  # environment fault, not a gate failure
         # --- Tier 2: perplexity rel-err vs frozen HF nll ---
         c_nll, c_ntok = parse_ppl(run_c(args.run, model_dir, full, "ppl"))
+        if c_nll is not None and c_ntok and c_ntok != rec["hf_ntok"]:
+            # Both averages divide by their own count, so they are comparable
+            # only over the same targets. A mismatch reads as rel=0 otherwise.
+            mismatched.append((i, c_ntok, rec["hf_ntok"]))
         if c_nll is None or not c_ntok:
             print_warnings()
             print(f"{args.run} printed no 'nll' line in ppl mode -- wrong binary or "
                   f"a build without the eval modes", file=sys.stderr)
             sys.exit(3)                  # environment fault, not a gate failure
-        hf_ppl = math.exp(rec["hf_nll"] / rec["hf_ntok"])
-        c_ppl = math.exp(c_nll / c_ntok)
+        hf_ppl = _ppl(rec["hf_nll"], rec["hf_ntok"])
+        c_ppl = _ppl(c_nll, c_ntok)
         rel = abs(c_ppl - hf_ppl) / hf_ppl
-        if not math.isfinite(rel):
+        if not (rel == rel and rel < math.inf):
             # max() compares with >, and every comparison with NaN is false, so a
             # NaN would leave the aggregate at 0.0 and pass the gate. The dataset
-            # side is validated above, so this came from the engine.
-            warn(f"request {i}: the engine's perplexity is not a finite number "
-                 f"(nll={c_nll}) -- scoring it as maximally wrong")
+            # side is validated above, so this came from the engine. Collected,
+            # not warned per request: one per request would push the summary
+            # block above N copies of the same line.
+            nonfinite.append(i)
             rel = float("inf")
         worst_ppl = max(worst_ppl, rel)
         if sd:
@@ -539,6 +571,14 @@ def main():
               f"D_top1={sd[0]*100:6.2f}% (tie {sd[1]*100:6.2f}%)  "
               f"ppl C={c_ppl:.4f} HF={hf_ppl:.4f} rel={rel:.2e}", flush=True)
 
+    if nonfinite:
+        warn(f"the engine's perplexity is not a finite number for {len(nonfinite)}/"
+             f"{n} request(s) {nonfinite[:8]} -- scored as maximally wrong")
+    if mismatched:
+        i, got, want = mismatched[0]
+        warn(f"{len(mismatched)}/{n} request(s) scored a different number of ppl "
+             f"targets than the reference (e.g. request {i}: {got} vs {want}) -- the "
+             f"two perplexities are not comparable")
     cmp = tot["cmp"] or 1
     d_strict = tot["D_ok"] / cmp
     p_strict = tot["P_ok"] / cmp
@@ -552,7 +592,8 @@ def main():
             print(f"    req{req} pos{pos}: gold {gold} != argmax {am}  gap={gap:.4f}"
                   + ("  [tie]" if gap <= args.tie else ""))
 
-    ok = d_strict >= thr["top1_strict"] and worst_ppl <= thr["ppl_rel"]
+    ok = (d_strict >= thr["top1_strict"] and worst_ppl <= thr["ppl_rel"]
+          and not mismatched)
 
     if args.fuzzy:
         ok = run_fuzzy(args, model_dir, prompts, comps, recs, thr) and ok

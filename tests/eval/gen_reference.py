@@ -102,6 +102,12 @@ def main():
         cids = out[0, plen:].tolist()
         full = torch.cat([pids, torch.tensor([cids])], dim=1)
         nll, ntok = hf_full_nll(model, full)
+        # The dataset is the frozen artefact of the exam: a non-finite or
+        # unusable nll here would be baked in, and every later `make eval` would
+        # report it as a misconfiguration of the grader's machine. Fail now.
+        if not (nll == nll and abs(nll) != float("inf")) or ntok < 1 or nll < 0:
+            sys.exit(f"prompt {i}: unusable teacher-forced nll {nll!r} over {ntok} "
+                     f"tokens -- refusing to freeze it into reference.json")
         records.append({"prompt_len": plen, "completion_len": len(cids),
                         "hf_nll": nll, "hf_ntok": ntok})
         prompt_lines.append(" ".join(map(str, pids[0].tolist())))
