@@ -16,7 +16,8 @@ A. DEFAULT -- drives the C `run` binary through its single-sequence eval modes:
   Both engine paths are scored: 'P' (prefill/unabsorbed) and 'D' (decode/absorbed),
   and BOTH gate on top1_strict. Measured on the frozen CPU build (2026-08-14,
   dsv2lite, full 5-request dev set): decode 100.000% (160/160), prefill 100.000%
-  (160/160 -- the two paths score the same positions, enforced per request),
+  (160/160 -- both paths report the same NUMBER of scored rows, enforced per
+  request; the position values themselves are not compared),
   worst ppl rel-err 2.695e-05. The 0.99 threshold was calibrated against the
   decode kernel; that run is the evidence for applying it to the prefill kernel
   too, which uses a different forward and accumulates different rounding.
@@ -211,6 +212,7 @@ _MAX_SEQ = 4096
 
 
 _KV_CACHE_CAP = 163840     # src/model_load.c KV_CACHE_CAP
+_RUN_C_MAX_IDS = 4096      # gen_reference.py's own --max-tokens ceiling
 
 
 def _kv_capacity(model_dir):
@@ -524,8 +526,9 @@ def main():
             # test below, which names the dataset instead.
             print_warnings()
             if kv_shown is not None and not (-2**31 <= kv_shown < 2**31):
-                why = (f"holds a max_position_embeddings that src/model_load.c "
-                       f"cannot represent (cfg_int casts it to a C int)")
+                why = (f"holds a max_position_embeddings ({kv_shown}) that "
+                       f"src/model_load.c cannot represent (cfg_int casts it to "
+                       f"a C int)")
             else:
                 why = (f"gives a KV cache length of {kv_cap}"
                        + ("" if kv_shown is None
@@ -554,12 +557,19 @@ def main():
             longest = need - 2               # the longest prompt itself
             if cap >= need:
                 fix = "regenerate the dataset with a smaller --max-tokens"
-            elif cap >= longest + 1:
+            elif cap == longest + 1 and need <= _RUN_C_MAX_IDS:
                 # A 1-token completion still fits, but gen_reference needs two
-                # free positions, so --max-tokens alone cannot do it.
+                # free positions above the prompt -- and it refuses a
+                # --max-tokens above the read limit, so `need` must fit too.
                 fix = (f"regenerate with --max-tokens {need} --max-new 1 (the "
                        f"longest prompt is {longest} tokens, so only a 1-token "
                        f"completion fits under {cap})")
+            elif cap >= longest:
+                # The prompt itself fits; what does not fit is the completion
+                # plus the 2 free positions gen_reference.py requires.
+                fix = (f"no flags help: the longest prompt is {longest} tokens, and "
+                       f"gen_reference.py needs 2 free positions above it -- "
+                       f"{raise_}, or shorten the prompts")
             else:
                 fix = (f"no flags help: the longest prompt is {longest} tokens and "
                        f"does not fit under {cap} on its own -- {raise_}, or "
