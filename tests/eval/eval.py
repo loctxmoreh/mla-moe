@@ -175,6 +175,16 @@ def warn(msg):
     print(f"  WARNING: {msg}", flush=True)
 
 
+def _usable_len(rec):
+    """completion_len usable as a generation count: a whole number >= 1."""
+    if not isinstance(rec, dict):
+        return False
+    v = rec.get("completion_len")
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 1
+
+
 def print_warnings():
     """Re-print next to the verdict. Must run before EVERY exit path, including
     the early ones -- a warning 500 lines up is a warning nobody reads."""
@@ -390,17 +400,31 @@ def main():
     if not isinstance(thr, dict):
         print(f"{args.thresholds} does not hold a JSON object", file=sys.stderr)
         sys.exit(2)
-    if not isinstance(recs, list):
-        print(f"{data}/reference.json: 'requests' is not a list", file=sys.stderr)
+    if not isinstance(recs, list) or not recs:
+        print(f"{data}/reference.json: 'requests' is not a non-empty list",
+              file=sys.stderr)
         sys.exit(2)
-    # Checked here, not at first use: the ppl read happens after the engine has
-    # already run request 0, so a malformed record would cost a timed pass first.
-    bad = [i for i, r in enumerate(recs)
-           if not isinstance(r, dict) or "hf_nll" not in r or not r.get("hf_ntok")]
-    if bad:
-        print(f"{data}/reference.json: record(s) {bad[:8]} miss a usable "
-              f"'hf_nll'/'hf_ntok' pair", file=sys.stderr)
-        sys.exit(2)
+    # Checked up front, not at first use: both reads happen after the engine has
+    # already run, so a malformed record would cost timed passes first -- and the
+    # --fuzzy read would discard a complete top-1/ppl result. Only the fields THIS
+    # run will actually read are required: --tokens reads neither pair.
+    def _num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    if args.tokens is None:              # path A reads the ppl pair
+        bad = [i for i, r in enumerate(recs)
+               if not isinstance(r, dict) or not _num(r.get("hf_nll"))
+               or not _num(r.get("hf_ntok")) or not r.get("hf_ntok")]
+        if bad:
+            print(f"{data}/reference.json: record(s) {bad[:8]} miss a usable "
+                  f"numeric 'hf_nll'/'hf_ntok' pair", file=sys.stderr)
+            sys.exit(2)
+        if args.fuzzy and not args.max_new:      # run_fuzzy reads completion_len
+            bad = [i for i, r in enumerate(recs) if not _usable_len(r)]
+            if bad:
+                print(f"{data}/reference.json: record(s) {bad[:8]} have no usable "
+                      f"'completion_len' -- pass --max-new", file=sys.stderr)
+                sys.exit(2)
     missing = [k for k in ("meteor", "bertscore_f1", "getp_min_prefix",
                            "getp_prefix", "top1_strict", "ppl_rel") if k not in thr]
     if missing:
@@ -581,15 +605,8 @@ def run_fuzzy(args, model_dir, prompts, comps, recs, thr):
     """Free-run greedy generation vs golden completion, scored METEOR+BERTScore."""
     preds = []
     for pids, rec in zip(prompts, recs):
-        # Guarded here rather than in the up-front record check: completion_len is
-        # only needed by --fuzzy, so a dataset without it still serves every other
-        # path. --max-new overrides it entirely.
-        if not args.max_new and not isinstance(rec.get("completion_len"), int):
-            print_warnings()
-            print(f"reference.json record has no usable 'completion_len' and no "
-                  f"--max-new was given", file=sys.stderr)
-            sys.exit(2)
-        max_new = args.max_new or rec["completion_len"]
+        # Validated up front (see main), so this only normalises JSON's 4.0.
+        max_new = args.max_new or int(rec["completion_len"])
         out = run_c(args.run, model_dir, pids, "gen", max_new)
         gen_ids = []
         for line in out.splitlines():
