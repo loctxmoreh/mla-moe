@@ -502,10 +502,11 @@ def main():
         # disagree), and teacher/ppl both hand the whole sequence to
         # forward_unabsorbed, which writes kv_l[p * KVD] for every position.
         cap = min(_MAX_SEQ, _kv_capacity(model_dir))
-        if cap < 2:
-            # model_load.c keeps a number below 2, so kv_cache is calloc(0) and
-            # every layer writes past a zero-size block. Refuse the model rather
-            # than grade against it, and say which file is at fault.
+        if cap < 1:
+            # Only a non-positive length is unloadable: calloc gets 0 bytes and
+            # every layer writes past a zero-size block. A length of 1 allocates
+            # fine and the engine runs a one-token sequence, so that case belongs
+            # to the too_long test below, which names the dataset instead.
             print_warnings()
             print(f"{model_dir}/config.json gives a KV cache length of {cap}: the "
                   f"engine cannot load this model", file=sys.stderr)
@@ -516,9 +517,16 @@ def main():
             print_warnings()
             src = ("src/run.c's id-read limit" if cap == _MAX_SEQ
                    else f"the KV cache sized from {model_dir}/config.json")
+            # --max-tokens only caps the COMPLETION; it cannot shorten a prompt,
+            # so it can only help when the shortest prompt plus one token fits.
+            shortest = min(len(p) for p in prompts) + 1
+            fix = ("regenerate the dataset with a smaller --max-tokens"
+                   if cap >= shortest else
+                   f"no --max-tokens value helps: the shortest prompt alone needs "
+                   f"{shortest} tokens -- use a model with a larger "
+                   f"max_position_embeddings, or shorter prompts")
             print(f"{data}: request(s) {too_long[:8]} exceed the {cap}-token limit "
-                  f"({src}) -- regenerate the dataset with a smaller --max-tokens",
-                  file=sys.stderr)
+                  f"({src}) -- {fix}", file=sys.stderr)
             sys.exit(2)                  # a harness limit, not a gate failure
 
         # path A reads the ppl pair
