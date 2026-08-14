@@ -195,6 +195,12 @@ def _ppl(nll, ntok):
         return float("inf")
 
 
+# src/run.c reads at most this many token ids; a longer sequence is silently
+# truncated there, which shows up as a ppl token-count mismatch and would
+# otherwise be reported as an engine defect.
+_MAX_SEQ = 4096
+
+
 def _usable_len(rec):
     """completion_len usable as a generation count: a whole number >= 1."""
     if not isinstance(rec, dict):
@@ -404,7 +410,6 @@ def score_tokens(args, model_dir, comps, thr):
 
 
 def main():
-    import math
     args = parse_args()
     data = args.dir or os.path.join(_HERE, args.model)
     try:
@@ -455,6 +460,16 @@ def main():
         sys.exit(2)
     check_dataset_model(args, ref, data)
 
+    if args.tokens is None:
+        too_long = [i for i, (p, c) in enumerate(zip(prompts, comps))
+                    if len(p) + len(c) > _MAX_SEQ]
+        if too_long:
+            print_warnings()
+            print(f"{data}: request(s) {too_long[:8]} exceed the {_MAX_SEQ}-token "
+                  f"limit of src/run.c -- regenerate the dataset with a smaller "
+                  f"--max-tokens", file=sys.stderr)
+            sys.exit(2)                  # a harness limit, not a gate failure
+
     if args.tokens is None:              # path A reads the ppl pair
         # hf_nll is a sum of negative log-likelihoods (>= 0); hf_ntok is a token
         # count. NaN/Infinity parse fine from JSON and would survive to make the
@@ -462,7 +477,7 @@ def main():
         bad = [i for i, r in enumerate(recs)
                if not isinstance(r, dict) or not _num(r.get("hf_nll"))
                or r["hf_nll"] < 0 or not _count(r.get("hf_ntok"))
-               or r["hf_nll"] / r["hf_ntok"] > _EXP_MAX]
+               or r["hf_nll"] > _EXP_MAX * r["hf_ntok"]]
         if bad:
             print_warnings()
             print(f"{data}/reference.json: record(s) {bad[:8]} miss a usable "
@@ -517,6 +532,7 @@ def main():
         sys.exit(3)                      # environment fault, not a gate failure
     print(f"[{args.model}] {model_dir}  ({n} requests)  tie={args.tie:.1e}", flush=True)
     print(f"  gates: top1_strict>={thr['top1_strict']}  ppl_rel<={thr['ppl_rel']}"
+          f"  ppl_ntok must match the reference"
           + (f"  meteor>={thr['meteor']}  bertscore_f1>={thr['bertscore_f1']}" if args.fuzzy else ""),
           flush=True)
 
@@ -586,6 +602,7 @@ def main():
     print(f"  decode-path  top1_strict = {d_strict*100:.3f}%  ({tot['D_ok']}/{cmp})")
     print(f"  prefill-path top1_strict = {p_strict*100:.3f}%")
     print(f"  worst ppl rel-err        = {worst_ppl:.3e}")
+    print(f"  ppl token-count mismatch = {len(mismatched)}/{n}")
     if all_misses:
         print(f"  decode misses (pos, gold, argmax, gap), worst first:")
         for req, pos, gold, am, gap in sorted(all_misses, key=lambda m: -m[4])[:10]:

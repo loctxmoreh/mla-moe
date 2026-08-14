@@ -105,7 +105,11 @@ def main():
         # The dataset is the frozen artefact of the exam: a non-finite or
         # unusable nll here would be baked in, and every later `make eval` would
         # report it as a misconfiguration of the grader's machine. Fail now.
-        if not (nll == nll and abs(nll) != float("inf")) or ntok < 1 or nll < 0:
+        # The 709.0 must equal _EXP_MAX in tests/eval/eval.py: past that mean,
+        # math.exp overflows and the reader rejects the record as a dataset
+        # defect -- which is exactly what this test exists to prevent.
+        if (not (nll == nll and abs(nll) != float("inf")) or ntok < 1 or nll < 0
+                or nll > 709.0 * ntok):
             sys.exit(f"prompt {i}: unusable teacher-forced nll {nll!r} over {ntok} "
                      f"tokens -- refusing to freeze it into reference.json")
         records.append({"prompt_len": plen, "completion_len": len(cids),
