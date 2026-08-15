@@ -273,7 +273,10 @@ def _kv_capacity(model_dir):
         cfg = json.loads(text, parse_int=lambda tok: (tok, int(tok)),
                          parse_float=pair, parse_constant=pair)
         if not isinstance(cfg, dict):
-            return _MAX_SEQ, None
+            # cJSON_Parse accepts a top-level array, and cJSON_GetObjectItem on
+            # one returns NULL, so cfg_int takes its default -- same as an
+            # absent key. (The engine still dies on n_layers = 0.)
+            return _KV_CACHE_CAP, None
         entry = cfg.get("max_position_embeddings")
         if not isinstance(entry, tuple):
             # Absent, or present but not a JSON number (a string, bool, list or
@@ -292,7 +295,12 @@ def _kv_capacity(model_dir):
             return None, raw
         return min(int(maxpos), _KV_CACHE_CAP), raw
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
-        return _MAX_SEQ, None
+        # Unreadable or not JSON. cJSON_Parse rejects it too, so the engine
+        # exits at the parse and reports it in its own words -- eval.py only has
+        # to reach that point without crashing. Do NOT return _MAX_SEQ: it would
+        # tie with src/run.c's read limit, and the too_long message would then
+        # name a KV cache read from a file that has none.
+        return _KV_CACHE_CAP, None
 
 
 def _usable_len(rec):
