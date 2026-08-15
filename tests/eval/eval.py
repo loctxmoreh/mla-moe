@@ -266,8 +266,12 @@ def _kv_capacity(model_dir):
         # The parsed value cannot distinguish the literal token `Infinity` (which
         # cJSON rejects outright) from `1e400` (valid JSON that cJSON parses to
         # inf), and both arrive here as Python inf. Keep the source token.
-        m = re.search(r'"max_position_embeddings"\s*:\s*([^,}\s]+)', text)
-        raw = m.group(1) if m else None
+        # Only trust the token when the key occurs once: a nested config (e.g.
+        # a multimodal text_config) would otherwise have us quote a value that
+        # json.load did not use. With several occurrences, fall back to the
+        # parsed top-level value, which is at least the one that decided `cap`.
+        hits = re.findall(r'"max_position_embeddings"\s*:\s*([^,}\s]+)', text)
+        raw = hits[0] if len(hits) == 1 else None
         maxpos = cfg.get("max_position_embeddings", _KV_CACHE_CAP)
         if isinstance(maxpos, bool) or not isinstance(maxpos, (int, float)):
             return _MAX_SEQ, None            # cfg_int() would take the default
@@ -279,8 +283,8 @@ def _kv_capacity(model_dir):
             # either: cJSON_Parse fails and model_load.c exits before the cache
             # is allocated.) cap None means "unrepresentable", which 0 cannot
             # signal -- 0 is itself a legal (and unloadable) cache length.
-            return None, raw
-        return min(int(maxpos), _KV_CACHE_CAP), raw
+            return None, raw if raw is not None else maxpos
+        return min(int(maxpos), _KV_CACHE_CAP), raw if raw is not None else maxpos
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         return _MAX_SEQ, None
 
