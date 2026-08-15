@@ -249,7 +249,9 @@ def _kv_capacity(model_dir):
     load the model; `shown` is the config value AS WRITTEN IN THE FILE, so the
     caller can quote what an operator will actually find there -- and can tell
     the literal `Infinity` (which cJSON rejects) from `1e400` (valid JSON that
-    cJSON parses to inf), which the parsed value cannot.
+    cJSON parses to inf), which the parsed value cannot. `shown` is None when
+    the file holds no top-level token for the key: quote the file, or quote
+    nothing.
 
     cfg_int() takes the default unless the value is a JSON number, so a numeric
     *string* must not be accepted here either -- int("2048") would make the two
@@ -260,21 +262,25 @@ def _kv_capacity(model_dir):
     try:
         with open(os.path.join(model_dir, "config.json")) as f:
             text = f.read()
-        cfg = json.loads(text)
-        if not isinstance(cfg, dict):
-            return _MAX_SEQ, None
         # The parsed value cannot distinguish the literal token `Infinity` (which
         # cJSON rejects outright) from `1e400` (valid JSON that cJSON parses to
-        # inf), and both arrive here as Python inf. Keep the source token.
-        # Only trust the token when the key occurs once: a nested config (e.g.
-        # a multimodal text_config) would otherwise have us quote a value that
-        # json.load did not use. With several occurrences, fall back to the
-        # parsed top-level value, which is at least the one that decided `cap`.
-        hits = re.findall(r'"max_position_embeddings"\s*:\s*([^,}\s]+)', text)
-        raw = hits[0] if len(hits) == 1 else None
-        maxpos = cfg.get("max_position_embeddings", _KV_CACHE_CAP)
-        if isinstance(maxpos, bool) or not isinstance(maxpos, (int, float)):
-            return _MAX_SEQ, None            # cfg_int() would take the default
+        # inf), and both arrive here as Python inf. So keep the source token
+        # beside the value: the number hooks see the exact text json.loads used,
+        # which a search over the file cannot promise -- a nested config (say a
+        # multimodal text_config) holds the key too, and a duplicate top-level
+        # key leaves only the last one standing.
+        pair = lambda tok: (tok, float(tok))                        # noqa: E731
+        cfg = json.loads(text, parse_int=lambda tok: (tok, int(tok)),
+                         parse_float=pair, parse_constant=pair)
+        if not isinstance(cfg, dict):
+            return _MAX_SEQ, None
+        entry = cfg.get("max_position_embeddings")
+        if not isinstance(entry, tuple):
+            # Absent, or present but not a JSON number (a string, bool, list or
+            # object never reaches the number hooks): cfg_int() takes its
+            # KV_CACHE_CAP default, and the file holds no token to quote.
+            return _KV_CACHE_CAP, None
+        raw, maxpos = entry
         if (isinstance(maxpos, float) and not math.isfinite(maxpos)) \
                 or not -2**31 <= int(maxpos) < 2**31:
             # cfg_int casts cJSON's valuedouble to a C int, so the value is lost
@@ -283,8 +289,8 @@ def _kv_capacity(model_dir):
             # either: cJSON_Parse fails and model_load.c exits before the cache
             # is allocated.) cap None means "unrepresentable", which 0 cannot
             # signal -- 0 is itself a legal (and unloadable) cache length.
-            return None, raw if raw is not None else maxpos
-        return min(int(maxpos), _KV_CACHE_CAP), raw if raw is not None else maxpos
+            return None, raw
+        return min(int(maxpos), _KV_CACHE_CAP), raw
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         return _MAX_SEQ, None
 
